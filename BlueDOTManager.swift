@@ -280,6 +280,7 @@ final class UpdateController: ObservableObject {
     func installUpdate() async {
         guard let downloadURL, let latestVersion else {
             status = "No update downloaded yet — check for updates first."
+            notifyManualCheck(title: "Can't install", message: status)
             return
         }
         isInstalling = true
@@ -321,16 +322,23 @@ final class UpdateController: ObservableObject {
             try? FileManager.default.removeItem(at: dmgPath)
 
             let destination = preferredInstallDestination(fallbackAppName: appBundle.lastPathComponent)
+            let logURL = installLogPath()
             status = "Quitting to install into \(destination.path)…"
-            try launchPostQuitInstall(stagedApp: stagedApp, destination: destination)
-            isInstalling = false
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            try launchPostQuitInstall(stagedApp: stagedApp, destination: destination, logURL: logURL)
+            status = "Closing to finish installing v\(latestVersion)…"
+            NSApp.activate(ignoringOtherApps: true)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                 NSApp.terminate(nil)
             }
         } catch {
             isInstalling = false
             status = "Install failed: \(error.localizedDescription)"
+            notifyManualCheck(title: "Install failed", message: status + "\n\nDetails may be in:\n\(installLogPath().path)")
         }
+    }
+
+    private func installLogPath() -> URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("bluedot-install-last.log")
     }
 
     private enum UpdateError: LocalizedError {
@@ -362,10 +370,9 @@ final class UpdateController: ObservableObject {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
-    private func launchPostQuitInstall(stagedApp: URL, destination: URL) throws {
+    private func launchPostQuitInstall(stagedApp: URL, destination: URL, logURL: URL) throws {
         let scriptURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("bluedot-install-\(UUID().uuidString).sh")
-        let logURL = FileManager.default.temporaryDirectory.appendingPathComponent("bluedot-install-last.log")
         let pid = ProcessInfo.processInfo.processIdentifier
         let stagedPath = shellQuote(stagedApp.path)
         let destPath = shellQuote(destination.path)
@@ -375,40 +382,47 @@ final class UpdateController: ObservableObject {
 
         let script = """
         #!/bin/bash
-        set -e
         LOG=\(logPath)
         STAGED=\(stagedPath)
         DEST=\(destPath)
-        echo "BlueDOT Manager update started" > "$LOG"
-        echo "Waiting for pid \(pid)…" >> "$LOG"
+        exec >>"$LOG" 2>&1
+        echo "BlueDOT Manager update started $(date)"
+        echo "Waiting for pid \(pid) to exit…"
         for _ in $(seq 1 240); do
           if ! kill -0 \(pid) 2>/dev/null; then break; fi
           sleep 0.25
         done
         install_app() {
-          rm -rf "$DEST"
+          /bin/rm -rf "$DEST"
           /usr/bin/ditto "$STAGED" "$DEST"
         }
-        if ! install_app >> "$LOG" 2>&1; then
-          echo "Retrying with administrator privileges…" >> "$LOG"
+        if ! install_app; then
+          echo "Retrying with administrator privileges…"
           INSTALL_CMD=$(printf '/bin/rm -rf %q && /usr/bin/ditto %q %q' "$DEST" "$STAGED" "$DEST")
-          /usr/bin/osascript -e "do shell script \"$INSTALL_CMD\" with administrator privileges" >> "$LOG" 2>&1
+          /usr/bin/osascript -e "do shell script \"$INSTALL_CMD\" with administrator privileges" || exit 1
         fi
+        echo "Launching $DEST"
         /usr/bin/open "$DEST"
-        rm -rf \(cachePath)
-        rm -f \(scriptPath)
+        /bin/rm -rf \(cachePath)
+        /bin/rm -f \(scriptPath)
+        echo "Update finished $(date)"
         """
 
         try script.write(to: scriptURL, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
 
+        // Spawn with nohup so the installer survives after this app quits.
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-        proc.arguments = [scriptURL.path]
-        proc.standardInput = FileHandle.nullDevice
-        proc.standardOutput = FileHandle.nullDevice
-        proc.standardError = FileHandle.nullDevice
+        proc.arguments = [
+            "-c",
+            "nohup /bin/bash \(shellQuote(scriptURL.path)) </dev/null >/dev/null 2>&1 &",
+        ]
         try proc.run()
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0 else {
+            throw UpdateError.postQuitScriptFailed("shell exit \(proc.terminationStatus)")
+        }
     }
 
     private func promptToInstall(version: String) {
@@ -420,6 +434,7 @@ final class UpdateController: ObservableObject {
         alert.addButton(withTitle: "Release notes")
         let result = alert.runModal()
         if result == .alertFirstButtonReturn {
+            NSApp.activate(ignoringOtherApps: true)
             Task { await installUpdate() }
         } else if result == .alertThirdButtonReturn {
             NSWorkspace.shared.open(AppUpdateConstants.releasesURL)
@@ -2980,8 +2995,36 @@ private struct TargetAlarmOverlay: View {
     }
 }
 
+private struct UpdateInstallOverlay: View {
+    @EnvironmentObject var updater: UpdateController
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.72).ignoresSafeArea()
+            VStack(spacing: 20) {
+                ProgressView()
+                    .controlSize(.large)
+                Text("Installing update")
+                    .font(.title2.weight(.semibold))
+                Text(updater.status)
+                    .font(.callout)
+                    .foregroundStyle(Theme.muted)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 360)
+                Text("The app will quit and reopen automatically.")
+                    .font(.caption)
+                    .foregroundStyle(Theme.muted)
+            }
+            .padding(32)
+            .background(Theme.panel, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(Theme.panelStroke))
+        }
+    }
+}
+
 private struct RootView: View {
     @EnvironmentObject var store: BluetoothStore
+    @EnvironmentObject var updater: UpdateController
     @State private var tab: SidebarTab? = .live
 
     var body: some View {
@@ -3005,7 +3048,10 @@ private struct RootView: View {
         }
         .background(Theme.ink)
         .overlay {
-            if store.targetAlarmRinging {
+            if updater.isInstalling {
+                UpdateInstallOverlay()
+                    .transition(.opacity)
+            } else if store.targetAlarmRinging {
                 ZStack {
                     Color.black.opacity(0.55).ignoresSafeArea()
                     TargetAlarmOverlay()
@@ -3014,6 +3060,7 @@ private struct RootView: View {
             }
         }
         .animation(.easeInOut(duration: 0.25), value: store.targetAlarmRinging)
+        .animation(.easeInOut(duration: 0.25), value: updater.isInstalling)
         .onExitCommand { if store.targetAlarmRinging { store.dismissTargetAlarm() } }
         .sheet(isPresented: Binding(
             get: { store.probePairingPresented },
