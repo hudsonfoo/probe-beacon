@@ -1,5 +1,7 @@
 {
-  "deviceUUID": "0B843D4E-A492-D46A-F05B-003EBA2B18DE",
+  "deviceUUID": "",
+  "dashboardHosting": "cloudflare",
+  "homeIngestPort": 8787,
   "useCelsius": false,
   "menuBarEnabled": true,
   "broadcastPaused": false,

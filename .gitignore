@@ -10,4 +10,5 @@ BlueDOTManager.app/Contents/MacOS/BlueDOTManager
 BlueDOTManager.app/Contents/_CodeSignature/
 BlueDOTReceiver.app/Contents/MacOS/BlueDOTReceiver
 BlueDOTReceiver.app/Contents/_CodeSignature/
+build/dmg-root/
 *.pem

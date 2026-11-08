@@ -6,6 +6,10 @@ BIN="$APP/Contents/MacOS/BlueDOTManager"
 swiftc -parse-as-library -O -o "$BIN" "$ROOT/BlueDOTManager.swift" \
   -framework SwiftUI -framework Charts -framework AppKit \
   -framework CoreBluetooth -framework UserNotifications
+RES="$APP/Contents/Resources/ingest-server"
+rm -rf "$RES"
+mkdir -p "$RES"
+cp "$ROOT/ingest-server/server.js" "$ROOT/ingest-server/package.json" "$RES/"
 /usr/bin/codesign --force --deep --sign - \
   --entitlements "$ROOT/BlueDOTManager.entitlements" \
   --options runtime \

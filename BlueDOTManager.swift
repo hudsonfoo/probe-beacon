@@ -4,6 +4,8 @@ import CoreBluetooth
 import UserNotifications
 import AppKit
 import AudioToolbox
+import Darwin
+import Security
 
 private let defaultDeviceUUID = UUID(uuidString: "0B843D4E-A492-D46A-F05B-003EBA2B18DE")!
 private let tempCharacteristicUUID = CBUUID(string: "783F2991-23E0-4BDC-AC16-78601BD84B39")
@@ -30,9 +32,11 @@ struct AppPreferences: Codable, Equatable {
     var ntfyEnabled: Bool
     var ntfyTopic: String
     var ntfyServer: String
+    var dashboardHosting: String
+    var homeIngestPort: Int
 
     static let defaults = AppPreferences(
-        deviceUUID: defaultDeviceUUID.uuidString,
+        deviceUUID: "",
         useCelsius: false,
         menuBarEnabled: true,
         broadcastPaused: false,
@@ -44,7 +48,9 @@ struct AppPreferences: Codable, Equatable {
         targetAlarmEnabled: true,
         ntfyEnabled: false,
         ntfyTopic: "",
-        ntfyServer: "https://ntfy.sh"
+        ntfyServer: "https://ntfy.sh",
+        dashboardHosting: DashboardHosting.cloudflare.rawValue,
+        homeIngestPort: 8787
     )
 
     init(
@@ -60,7 +66,9 @@ struct AppPreferences: Codable, Equatable {
         targetAlarmEnabled: Bool = true,
         ntfyEnabled: Bool = false,
         ntfyTopic: String = "",
-        ntfyServer: String = "https://ntfy.sh"
+        ntfyServer: String = "https://ntfy.sh",
+        dashboardHosting: String = DashboardHosting.cloudflare.rawValue,
+        homeIngestPort: Int = 8787
     ) {
         self.deviceUUID = deviceUUID
         self.useCelsius = useCelsius
@@ -75,6 +83,12 @@ struct AppPreferences: Codable, Equatable {
         self.ntfyEnabled = ntfyEnabled
         self.ntfyTopic = ntfyTopic
         self.ntfyServer = ntfyServer
+        self.dashboardHosting = dashboardHosting
+        self.homeIngestPort = homeIngestPort
+    }
+
+    var hosting: DashboardHosting {
+        DashboardHosting(rawValue: dashboardHosting) ?? .cloudflare
     }
 
     init(from decoder: Decoder) throws {
@@ -92,6 +106,96 @@ struct AppPreferences: Codable, Equatable {
         ntfyEnabled = try c.decodeIfPresent(Bool.self, forKey: .ntfyEnabled) ?? false
         ntfyTopic = try c.decodeIfPresent(String.self, forKey: .ntfyTopic) ?? ""
         ntfyServer = try c.decodeIfPresent(String.self, forKey: .ntfyServer) ?? "https://ntfy.sh"
+        dashboardHosting = try c.decodeIfPresent(String.self, forKey: .dashboardHosting) ?? DashboardHosting.cloudflare.rawValue
+        homeIngestPort = try c.decodeIfPresent(Int.self, forKey: .homeIngestPort) ?? 8787
+    }
+}
+
+enum DashboardHosting: String, Codable, CaseIterable, Identifiable {
+    case cloudflare
+    case homeNetwork
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .cloudflare: "Cloudflare (HTTPS, recommended)"
+        case .homeNetwork: "Home network (public IP + port forward)"
+        }
+    }
+}
+
+// MARK: - Local ingest (home hosting)
+
+private final class LocalIngestServer {
+    private var process: Process?
+    private(set) var isRunning = false
+
+    func bundledServerDirectory() -> URL? {
+        Bundle.main.resourceURL?.appendingPathComponent("ingest-server", isDirectory: true)
+    }
+
+    func nodeExecutable() -> String? {
+        let paths = ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"]
+        for p in paths where FileManager.default.isExecutableFile(atPath: p) { return p }
+        return nil
+    }
+
+    func start(port: Int, token: String) -> String? {
+        stop()
+        guard let dir = bundledServerDirectory(),
+              FileManager.default.fileExists(atPath: dir.appendingPathComponent("server.js").path)
+        else { return "ingest-server not found in app bundle (reinstall from release DMG)" }
+        guard let node = nodeExecutable() else { return "Install Node.js (brew install node) for home hosting" }
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: node)
+        proc.arguments = ["server.js"]
+        proc.currentDirectoryURL = dir
+        var env = ProcessInfo.processInfo.environment
+        env["PORT"] = "\(port)"
+        env["INGEST_TOKEN"] = token
+        proc.environment = env
+        do {
+            try proc.run()
+            process = proc
+            isRunning = true
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
+    func stop() {
+        process?.terminate()
+        process = nil
+        isRunning = false
+    }
+}
+
+private enum NetworkEndpoints {
+    static func fetchPublicIPv4(completion: @escaping (String?) -> Void) {
+        guard let url = URL(string: "https://api.ipify.org") else { completion(nil); return }
+        URLSession.shared.dataTask(with: url) { data, _, _ in
+            let ip = data.flatMap { String(data: $0, encoding: .utf8) }?.trimmingCharacters(in: .whitespacesAndNewlines)
+            DispatchQueue.main.async { completion(ip) }
+        }.resume()
+    }
+
+    static func localIPv4() -> String? {
+        var addr: String?
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }
+        defer { freeifaddrs(ifaddr) }
+        for ptr in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let iface = ptr.pointee
+            guard iface.ifa_addr.pointee.sa_family == UInt8(AF_INET) else { continue }
+            let name = String(cString: iface.ifa_name)
+            guard name == "en0" || name.hasPrefix("en") else { continue }
+            var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            getnameinfo(iface.ifa_addr, socklen_t(iface.ifa_addr.pointee.sa_len), &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST)
+            let ip = String(cString: hostname)
+            if !ip.hasPrefix("127.") { addr = ip; break }
+        }
+        return addr
     }
 }
 
@@ -549,8 +653,12 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
     @Published var feedStatus = "Tap Test feed to verify the public dashboard."
     @Published var broadcastOK = false
     @Published var targetAlarmRinging = false
+    @Published var publicIPv4: String?
+    @Published var localIPv4: String?
+    @Published var homeIngestStatus = ""
 
     private var manager: CBCentralManager!
+    private let localIngest = LocalIngestServer()
     private var peripheral: CBPeripheral?
     private var tempCharacteristic: CBCharacteristic?
     private var reconnectWorkItem: DispatchWorkItem?
@@ -655,6 +763,7 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
         center.delegate = NotificationDelegate.shared
         center.requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
         MenuBarController.shared.attach(store: self)
+        refreshNetworkAddresses()
 
         // State-restore identifier is iOS-only; on macOS it aborts inside CoreBluetooth.
         manager = CBCentralManager(delegate: self, queue: nil)
@@ -825,10 +934,6 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
 
     // MARK: BLE
 
-    private func targetUUID() -> UUID {
-        UUID(uuidString: prefs.deviceUUID) ?? defaultDeviceUUID
-    }
-
     private func scheduleReconnect(after: TimeInterval = 3.0) {
         reconnectWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.beginConnectionAttempt() }
@@ -840,8 +945,8 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
         guard let manager, manager.state == .poweredOn else { return }
         connectionState = "connecting"
         detailLine = "Connecting…"
-        let id = targetUUID()
-        if let p = manager.retrievePeripherals(withIdentifiers: [id]).first {
+        if !prefs.deviceUUID.isEmpty, let id = UUID(uuidString: prefs.deviceUUID),
+           let p = manager.retrievePeripherals(withIdentifiers: [id]).first {
             peripheral = p
             p.delegate = self
             manager.stopScan()
@@ -850,6 +955,52 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
         }
         detailLine = "Scanning for BlueDOT…"
         manager.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+    }
+
+    func rememberDiscoveredProbe(_ peripheral: CBPeripheral) {
+        let uuid = peripheral.identifier.uuidString
+        guard prefs.deviceUUID != uuid else { return }
+        prefs.deviceUUID = uuid
+        try? ConfigLoader.savePreferences(prefs)
+    }
+
+    func refreshNetworkAddresses() {
+        localIPv4 = NetworkEndpoints.localIPv4()
+        NetworkEndpoints.fetchPublicIPv4 { [weak self] ip in self?.publicIPv4 = ip }
+    }
+
+    func applyHomeNetworkHosting() {
+        refreshNetworkAddresses()
+        let port = prefs.homeIngestPort
+        var token = ingest.token
+        if token.isEmpty { token = generateToken(); ingest.token = token }
+        let localIngestURL = "http://127.0.0.1:\(port)/api/ingest"
+        ingest.ingestURL = localIngestURL
+        prefs.dashboardHosting = DashboardHosting.homeNetwork.rawValue
+        if let err = localIngest.start(port: port, token: token) {
+            homeIngestStatus = err
+        } else {
+            let remote = publicIPv4.map { "http://\($0):\(port)/" } ?? "http://YOUR_PUBLIC_IP:\(port)/"
+            homeIngestStatus = "Server running. Forward TCP \(port) on your router to this Mac. Dashboard: \(remote)"
+        }
+        saveAll()
+    }
+
+    func stopHomeIngestServer() {
+        localIngest.stop()
+        homeIngestStatus = "Stopped local ingest server."
+    }
+
+    var suggestedHomeDashboardURL: String {
+        let port = prefs.homeIngestPort
+        if let ip = publicIPv4 { return "http://\(ip):\(port)/" }
+        return "http://YOUR_PUBLIC_IP:\(port)/"
+    }
+
+    private func generateToken() -> String {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        return bytes.map { String(format: "%02x", $0) }.joined()
     }
 
     nonisolated func centralManagerDidUpdateState(_ central: CBCentralManager) {
@@ -876,13 +1027,15 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
         Task { @MainActor in
             lastRSSI = rssi.intValue
             let name = p.name ?? (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? ""
-            let matches = p.identifier == targetUUID()
-                || name == preferredLocalName
+            let saved = prefs.deviceUUID.isEmpty ? nil : UUID(uuidString: prefs.deviceUUID)
+            let matches = name == preferredLocalName
                 || name.lowercased().contains("bluedot")
+                || (saved != nil && p.identifier == saved)
             guard matches else { return }
             central.stopScan()
             peripheral = p
             p.delegate = self
+            rememberDiscoveredProbe(p)
             detailLine = "Found \(name.isEmpty ? p.identifier.uuidString : name)"
             central.connect(p, options: nil)
         }
@@ -1717,12 +1870,59 @@ private struct SettingsScreen: View {
         ZStack {
             Theme.ink.ignoresSafeArea()
             Form {
-                Section("Cloud ingest") {
-                    TextField("Ingest URL", text: $store.ingest.ingestURL)
-                    SecureField("Bearer token", text: $store.ingest.token)
+                Section {
+                    Picker("Hosting", selection: Binding(
+                        get: { store.prefs.hosting },
+                        set: { store.prefs.dashboardHosting = $0.rawValue }
+                    )) {
+                        ForEach(DashboardHosting.allCases) { h in
+                            Text(h.label).tag(h)
+                        }
+                    }
+                    if store.prefs.hosting == .cloudflare {
+                        TextField("Ingest URL", text: $store.ingest.ingestURL)
+                        SecureField("Bearer token", text: $store.ingest.token)
+                        Text("Use a Cloudflare Worker URL ending in /api/ingest (see README).")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        TextField("Port", value: $store.prefs.homeIngestPort, format: .number)
+                        if let lan = store.localIPv4 {
+                            LabeledContent("This Mac (LAN)", value: lan)
+                        }
+                        if let pub = store.publicIPv4 {
+                            LabeledContent("Your public IP", value: pub)
+                        }
+                        Text(store.suggestedHomeDashboardURL)
+                            .font(.caption.monospaced())
+                            .textSelection(.enabled)
+                        Text(store.homeIngestStatus)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        HStack {
+                            Button("Detect IPs") { store.refreshNetworkAddresses() }
+                            Button("Start home server") { store.applyHomeNetworkHosting() }
+                            Button("Stop") { store.stopHomeIngestServer() }
+                        }
+                        Text("On your router, forward the port above to this Mac. Visitors use http://PUBLIC_IP:PORT/ (HTTP, not HTTPS).")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("Live dashboard")
                 }
                 Section("Probe") {
-                    TextField("Device UUID", text: $store.prefs.deviceUUID)
+                    if store.prefs.deviceUUID.isEmpty {
+                        Text("BlueDOT is found automatically when scanning.")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        LabeledContent("Saved probe", value: store.prefs.deviceUUID)
+                        Button("Forget saved probe (rescan)") {
+                            store.prefs.deviceUUID = ""
+                            store.saveAll()
+                            store.reconnect()
+                        }
+                    }
                 }
                 Section("Target (ETA)") {
                     Toggle("Track target temperature", isOn: $store.prefs.targetEnabled)
