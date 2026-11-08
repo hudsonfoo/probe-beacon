@@ -61,7 +61,7 @@ const HTML = `<!DOCTYPE html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>BlueDOT Live</title>
+  <title>ProbeBeacon Live</title>
   <style>
     :root { color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; }
     * { box-sizing: border-box; }
@@ -83,7 +83,7 @@ const HTML = `<!DOCTYPE html>
 </head>
 <body>
   <div class="wrap">
-    <h1>ThermoWorks BlueDOT</h1>
+    <h1>Live BBQ temperature</h1>
     <p class="temp" id="temp">—<span class="unit">°F</span></p>
     <div class="stats" id="stats" hidden>
       <div>Session min<strong id="tmin">—</strong></div>

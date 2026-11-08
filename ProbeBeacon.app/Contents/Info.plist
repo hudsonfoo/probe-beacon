@@ -5,22 +5,22 @@
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
 	<key>CFBundleExecutable</key>
-	<string>BlueDOTManager</string>
+	<string>ProbeBeacon</string>
 	<key>CFBundleIdentifier</key>
 	<string>local.david.BlueDOTManager</string>
 	<key>CFBundleName</key>
-	<string>BlueDOT Manager</string>
+	<string>ProbeBeacon</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.3.5</string>
+	<string>1.4.0</string>
 	<key>CFBundleVersion</key>
-	<string>10</string>
+	<string>11</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>Connect to your ThermoWorks BlueDOT to receive its actual temperature readings.</string>
+	<string>ProbeBeacon connects to Bluetooth meat thermometers (MEATER, BlueDOT, Inkbird, Thermapen, and others) to show live temperatures.</string>
 	<key>NSBluetoothPeripheralUsageDescription</key>
-	<string>Connect to your ThermoWorks BlueDOT thermometer.</string>
+	<string>Connect to your Bluetooth cooking thermometers.</string>
 </dict>
 </plist>

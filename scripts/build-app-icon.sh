@@ -3,7 +3,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ICONSET="$ROOT/AppIcon.iconset"
 SOURCE="$ROOT/assets/AppIcon-source.jpg"
-ICNS="$ROOT/BlueDOTManager.app/Contents/Resources/AppIcon.icns"
+ICNS="$ROOT/ProbeBeacon.app/Contents/Resources/AppIcon.icns"
 
 if [[ ! -d "$ICONSET" ]]; then
   echo "Missing $ICONSET"

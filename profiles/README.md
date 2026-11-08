@@ -1,4 +1,4 @@
-# Thermometer profiles
+# Thermometer profiles (ProbeBeacon)
 
 Device support is defined in code (`ThermometerProfiles.swift`) and selected per probe in **Settings → Probes → Driver**.
 

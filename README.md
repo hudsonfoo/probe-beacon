@@ -1,37 +1,43 @@
-# ThermoWorks BlueDOT Manager
+# ProbeBeacon
 
-Open-source macOS app + live temperature dashboard for the [ThermoWorks BlueDOT](https://www.thermoworks.com/bluedot/) Bluetooth probe.
+**ProbeBeacon** is a free, open-source **macOS Bluetooth meat thermometer app**: connect **MEATER**, **ThermoWorks BlueDOT**, **Thermapen Blue**, **Inkbird iBBQ**, and other BLE probes, stream live temps, track cooks, share a **public BBQ thermometer dashboard**, and get target alarms on your Mac or iPhone (ntfy).
 
-Stream BLE readings to a **public dashboard**, track **cooks**, **target ETA**, **alarms**, menu bar, and optional **iPhone push** (ntfy).
+> Formerly distributed as “BlueDOT Manager” — same project, now built for multiple brands.
 
-**BLE temperature:** characteristic `783F2991-23E0-4BDC-AC16-78601BD84B39` — bytes 1–4 are a **32-bit little-endian integer of whole °F** (not tenths). This repo implements discovery, decoding, and UI end-to-end; no external bridge app required.
+## Supported Bluetooth thermometers
+
+| Device | Driver in app | How it’s detected |
+|--------|---------------|-------------------|
+| [ThermoWorks BlueDOT](https://www.thermoworks.com/bluedot/) | ThermoWorks BlueDOT | BLE name `BlueDOT` |
+| [MEATER](https://www.meater.com/) / MEATER+ / MEATER 2 | MEATER | Name `MEATER`, service `A75CC7FC-…` |
+| [Thermapen Blue](https://www.thermoworks.com/thermapen-blue/) (ETI) | Thermapen Blue | Name `Thermapen`; press **Transfer** to send readings |
+| [Inkbird iBBQ](https://inkbird.com/) / IBT-2x / 4x / 6x / 8x | Inkbird iBBQ | Names like `iBBQ`, `Inkbird`, `IBT-`; service `FFF0` |
+| Other BLE cooking probes | **Auto-detect** | Thermometer-like name or GATT; infers payload shape (see [profiles/README.md](profiles/README.md)) |
+
+**Auto-detect** tries standard BLE **Health Thermometer** (`0x1809`), common vendor characteristics, and ranked heuristics (scaled integers, floats, MEATER/Inkbird layouts) and locks onto a plausible food-temp stream.
+
+PRs welcome for more profiles — see [Contributing](#contributing).
 
 ## Quick start (download)
 
 **No build tools required.**
 
-1. Download the latest **BlueDOT-Manager-*.dmg** from [Releases](https://github.com/hudsonfoo/thermoworks-bluedot-manager/releases/latest).
-2. Open the DMG and drag **BlueDOT Manager** into the **Applications** folder.
-3. **First launch only** — macOS may say it can’t verify the app (open-source builds aren’t Apple-notarized). Use either method:
-   - **Easiest:** In **Finder → Applications**, **right-click** (or Control-click) **BlueDOT Manager** → **Open** → click **Open** in the dialog. You only need to do this once; after that, double-click works.
-   - **Or:** Open **Terminal** and run (adjust the path if needed):
-     ```bash
-     xattr -dr com.apple.quarantine "/Applications/BlueDOT Manager.app"
-     ```
-     Then open the app normally from Applications.
-4. Allow **Bluetooth** and **Notifications** when prompted.
-5. Turn on your BlueDOT — the app **finds it automatically** (no UUID hunting).
-6. **Settings → Updates** or **File → Check for Updates…** — in-app upgrades from GitHub (optional auto-check on launch).
-
-> **Why the security message?** Release builds are signed for local use but not notarized with Apple. The app is open source on GitHub; the right-click **Open** path is Apple’s standard way to approve a downloaded app you trust.
+1. Download the latest **`ProbeBeacon-*.dmg`** from [Releases](https://github.com/hudsonfoo/thermoworks-bluedot-manager/releases/latest) (older assets may be named `BlueDOT-Manager-*.dmg`).
+2. Open the DMG and drag **ProbeBeacon** into **Applications**.
+3. **First launch** — macOS may say it can’t verify the app (not Apple-notarized). Either:
+   - **Right-click** **ProbeBeacon** in Applications → **Open** → **Open** (once), or
+   - `xattr -dr com.apple.quarantine "/Applications/ProbeBeacon.app"`
+4. Allow **Bluetooth** and **Notifications**.
+5. **Settings → Add thermometer…** — choose your brand (or Auto-detect), wake the probe nearby.
+6. Optional: **File → Check for Updates…** for in-app upgrades.
 
 ### Live dashboard (pick one)
 
-**Option A — Cloudflare (HTTPS, works from anywhere)**  
-See [Cloudflare setup](#cloudflare-https-recommended) below, then paste ingest URL + token in **Settings → Live dashboard**.
+**Option A — Cloudflare (HTTPS)**  
+Deploy the Worker in [Cloudflare setup](#cloudflare-https-recommended), then paste ingest URL + token under **Settings → Live dashboard**.
 
-**Option B — Home network (your public IP)**  
-In **Settings → Live dashboard**, choose **Home network**, tap **Detect IPs**, then **Start home server**. Forward the shown **TCP port** on your router to your Mac. Share `http://YOUR_PUBLIC_IP:PORT/` (HTTP). The app posts to a local server bundled inside the `.app` (requires [Node.js](https://nodejs.org/) installed).
+**Option B — Home network**  
+**Settings → Home network** → **Detect IPs** → **Start home server** → port-forward on your router. Share `http://YOUR_PUBLIC_IP:PORT/` (HTTP). Requires [Node.js](https://nodejs.org/) on the Mac.
 
 ## Build from source
 
@@ -39,10 +45,10 @@ In **Settings → Live dashboard**, choose **Home network**, tap **Detect IPs**,
 git clone git@github.com:hudsonfoo/thermoworks-bluedot-manager.git
 cd thermoworks-bluedot-manager
 ./build-manager.sh
-open BlueDOTManager.app
+open ProbeBeacon.app
 ```
 
-DMG for maintainers: `./scripts/package-dmg.sh` → `build/BlueDOT-Manager-*.dmg`
+DMG: `./scripts/package-dmg.sh` → `build/ProbeBeacon-*.dmg`
 
 ## Cloudflare (HTTPS, recommended)
 
@@ -58,33 +64,30 @@ printf '%s' "$TOKEN" | npx wrangler secret put INGEST_TOKEN
 npx wrangler deploy
 ```
 
-In the Mac app **Settings → Live dashboard → Cloudflare**, set:
+In the Mac app **Settings → Live dashboard → Cloudflare**:
 
-- **Ingest URL:** `https://bluedot-live.<you>.workers.dev/api/ingest`
-- **Token:** same `TOKEN` as above → **Save settings**
-
-Open the dashboard root URL in a browser (no token in the page).
+- **Ingest URL:** `https://your-worker.workers.dev/api/ingest`
+- **Token:** same as `TOKEN` above → **Save settings**
 
 ## Home network (public IP)
 
-Good if you prefer not to use Cloudflare and can forward a port on your router.
-
-1. Install Node.js (`brew install node`) if needed.
+1. Install Node.js if needed (`brew install node`).
 2. **Settings → Live dashboard → Home network**
-3. **Detect IPs** — shows LAN + public IPv4
-4. **Start home server** — runs bundled `ingest-server` on the chosen port
-5. On your router: **port forward** that TCP port to this Mac’s **LAN IP**
-6. Remote viewers open `http://<public-ip>:<port>/`
-
-The Mac app always ingests to `http://127.0.0.1:<port>/api/ingest` locally; visitors use the public IP URL. This is plain **HTTP** (no TLS) unless you add your own reverse proxy.
+3. **Detect IPs** → **Start home server**
+4. Forward the TCP port on your router to this Mac
+5. Share `http://<public-ip>:<port>/`
 
 ## Features
 
-- Auto-discovery of **BlueDOT** by name (UUID saved after first connect); **multiple probes** (Settings → **Add BlueDOT…**)
-- **Cooks** in `~/.config/bluedot-receiver/cooks.json` (24h gap → new cook, titles, manual **New cook**)
-- Target **ETA**, **alarm** with dismiss/snooze, menu bar, ntfy iPhone push
+- Multi-brand **Bluetooth thermometer** support (table above)
+- **Multiple probes** at once; switch live view per probe
+- **Cook history** with titles and charts
+- Target **ETA**, **alarms**, menu bar, optional **ntfy** iPhone push
+- In-app **GitHub updates**
 
 ## Config on disk (not in git)
+
+Legacy folder name `bluedot-receiver` is unchanged for upgrades:
 
 | File | Purpose |
 |------|---------|
@@ -98,15 +101,16 @@ See `examples/`.
 
 | Issue | Fix |
 |--------|-----|
-| “Apple could not verify…” / app won’t open | First launch: **right-click → Open** in Applications (see [Quick start](#quick-start-download)), or clear quarantine with `xattr -dr com.apple.quarantine` on the `.app` |
-| Bluetooth prompt every rebuild | Use the **release DMG** or `./build-manager.sh`; allow once in System Settings |
-| Wrong temperature (÷10) | Fixed in 1.1+ — raw int is °F |
-| Home server won’t start | Install Node; use release DMG (includes ingest-server in bundle) |
-| Public page empty | Token must match server; keep app running + probe connected |
+| “Apple could not verify…” | [Quick start](#quick-start-download) — right-click **Open** or `xattr` |
+| Wrong or no temperature | **Settings → Probes → Driver** — pick the correct brand; Thermapen needs **Transfer** |
+| MEATER not found | Wake probe; choose **MEATER** driver when pairing |
+| Inkbird not streaming | Ensure probes are seated; use **Inkbird iBBQ** driver |
+| Bluetooth prompt every rebuild | Use release DMG or `./build-manager.sh`; allow once in System Settings |
+| Public page empty | Token must match server; app running + probe connected |
 
 ## Contributing
 
-**Pull requests are welcome.** Bug fixes, docs, Worker/dashboard improvements, and UX polish all help. Open an issue first if you’re planning a large change so we can align on direction.
+**Pull requests are welcome.** New thermometer profiles, docs, Worker/dashboard work, and UX polish all help. Open an issue before large changes.
 
 ## License
 

@@ -226,7 +226,7 @@ final class UpdateController: ObservableObject {
         }
         var req = URLRequest(url: api)
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-        req.setValue("BlueDOT-Manager", forHTTPHeaderField: "User-Agent")
+        req.setValue("ProbeBeacon", forHTTPHeaderField: "User-Agent")
 
         do {
             let (data, response) = try await URLSession.shared.data(for: req)
@@ -238,8 +238,9 @@ final class UpdateController: ObservableObject {
             let release = try JSONDecoder().decode(GitHubRelease.self, from: data)
             let version = release.tagName.trimmingCharacters(in: CharacterSet(charactersIn: "vV"))
             latestVersion = version
-            let preferredDMG = "BlueDOT-Manager-\(version).dmg"
+            let preferredDMG = "ProbeBeacon-\(version).dmg"
             let dmgAsset = release.assets.first(where: { $0.name == preferredDMG })
+                ?? release.assets.first(where: { $0.name.hasPrefix("ProbeBeacon") && $0.name.hasSuffix(".dmg") })
                 ?? release.assets.first(where: { $0.name.hasPrefix("BlueDOT-Manager") && $0.name.hasSuffix(".dmg") })
                 ?? release.assets.first(where: { $0.name.hasSuffix(".dmg") })
             if let dmg = dmgAsset {
@@ -254,7 +255,7 @@ final class UpdateController: ObservableObject {
                     promptToInstall(version: version)
                 }
             } else {
-                status = "BlueDOT Manager v\(currentVersion) is up to date."
+                status = "ProbeBeacon v\(currentVersion) is up to date."
                 latestVersion = nil
                 downloadURL = nil
                 if !silent { promptUpToDate() }
@@ -268,7 +269,7 @@ final class UpdateController: ObservableObject {
     private func promptUpToDate() {
         let alert = NSAlert()
         alert.messageText = "You're up to date"
-        alert.informativeText = "BlueDOT Manager v\(currentVersion) is the latest release on GitHub."
+        alert.informativeText = "ProbeBeacon v\(currentVersion) is the latest release on GitHub."
         alert.addButton(withTitle: "OK")
         alert.runModal()
     }
@@ -302,7 +303,7 @@ final class UpdateController: ObservableObject {
             }
 
             let dmgPath = FileManager.default.temporaryDirectory
-                .appendingPathComponent("BlueDOT-Manager-\(latestVersion).dmg")
+                .appendingPathComponent("ProbeBeacon-\(latestVersion).dmg")
             try dmgData.write(to: dmgPath, options: .atomic)
 
             status = "Mounting installer…"
@@ -390,7 +391,7 @@ final class UpdateController: ObservableObject {
         STAGED=\(stagedPath)
         DEST=\(destPath)
         exec >>"$LOG" 2>&1
-        echo "BlueDOT Manager update started $(date)"
+        echo "ProbeBeacon update started $(date)"
         echo "Waiting for pid \(pid) to exit…"
         for _ in $(seq 1 240); do
           if ! kill -0 \(pid) 2>/dev/null; then break; fi
@@ -432,7 +433,7 @@ final class UpdateController: ObservableObject {
     private func promptToInstall(version: String) {
         let alert = NSAlert()
         alert.messageText = "Update available"
-        alert.informativeText = "BlueDOT Manager v\(version) is available (you have v\(currentVersion)). The app will download, quit, replace itself, and reopen."
+        alert.informativeText = "ProbeBeacon v\(version) is available (you have v\(currentVersion)). The app will download, quit, replace itself, and reopen."
         alert.addButton(withTitle: "Download & Install")
         alert.addButton(withTitle: "Later")
         alert.addButton(withTitle: "Release notes")
@@ -1355,13 +1356,13 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
         }
         switch manager.state {
         case .poweredOn:
-            probePairingStatus = "Looking for a BlueDOT near your Mac…"
+            probePairingStatus = "Looking for a thermometer near your Mac…"
             beginScanForAdditionalProbe()
             scheduleProbePairingTimeout()
         case .poweredOff:
             probePairingStatus = "Turn on Bluetooth in Control Center, then tap Try again."
         case .unauthorized:
-            probePairingStatus = "Allow Bluetooth for BlueDOT Manager in System Settings → Privacy & Security."
+            probePairingStatus = "Allow Bluetooth for ProbeBeacon in System Settings → Privacy & Security."
         default:
             probePairingStatus = "Bluetooth isn’t ready yet (status \(manager.state.rawValue)). Try again shortly."
         }
@@ -1387,7 +1388,7 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
             Task { @MainActor in
                 guard let self, self.probePairingPresented, !self.probePairingSucceeded else { return }
                 self.scanningForMoreProbes = false
-                self.probePairingStatus = "No new BlueDOT found yet."
+                self.probePairingStatus = "No new thermometer found yet."
                 self.manager?.stopScan()
             }
         }
@@ -2202,7 +2203,7 @@ final class MenuBarController: NSObject {
 
         menu.addItem(.separator())
 
-        let show = NSMenuItem(title: "Show BlueDOT Manager", action: #selector(focusApp), keyEquivalent: "")
+        let show = NSMenuItem(title: "Show ProbeBeacon", action: #selector(focusApp), keyEquivalent: "")
         show.target = self
         menu.addItem(show)
 
@@ -2346,7 +2347,7 @@ private struct LiveScreen: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("ThermoWorks BlueDOT")
+                    Text("Live temperature")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(Theme.muted)
                         .textCase(.uppercase)
@@ -2980,7 +2981,7 @@ private struct SettingsScreen: View {
                 }
                 Section {
                     if store.prefs.savedProbeUUIDs.isEmpty {
-                        Text("BlueDOT probes are found automatically on first launch. Tap “Add BlueDOT…” to pair another unit.")
+                        Text("Thermometers pair from Add thermometer…. Choose the brand or Auto-detect.")
                             .foregroundStyle(.secondary)
                     }
                     ForEach(store.probeSummaries) { probe in
@@ -3050,7 +3051,7 @@ private struct SettingsScreen: View {
                     }
                 }
                 Section {
-                    Text("Mac banners require Notifications enabled for BlueDOT Manager in System Settings.")
+                    Text("Mac banners require Notifications enabled for ProbeBeacon in System Settings.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Button("Test Mac + iPhone notifications") { store.testNotifications() }
@@ -3184,7 +3185,7 @@ private struct RootView: View {
                 Label(item.title, systemImage: item.symbol)
                     .tag(item)
             }
-            .navigationTitle("BlueDOT")
+            .navigationTitle("ProbeBeacon")
             .listStyle(.sidebar)
         } detail: {
             Group {
@@ -3226,7 +3227,7 @@ private struct RootView: View {
 // MARK: - App entry
 
 @main
-struct BlueDOTManagerApp: App {
+struct ProbeBeaconApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var store = BluetoothStore()
     @StateObject private var updater = UpdateController()

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-APP="$ROOT/BlueDOTManager.app"
-BIN="$APP/Contents/MacOS/BlueDOTManager"
+APP="$ROOT/ProbeBeacon.app"
+BIN="$APP/Contents/MacOS/ProbeBeacon"
 if [[ -d "$ROOT/AppIcon.iconset" ]]; then
   "$ROOT/scripts/build-app-icon.sh"
 fi
