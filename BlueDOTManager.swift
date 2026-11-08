@@ -232,7 +232,11 @@ final class UpdateController: ObservableObject {
             let release = try JSONDecoder().decode(GitHubRelease.self, from: data)
             let version = release.tagName.trimmingCharacters(in: CharacterSet(charactersIn: "vV"))
             latestVersion = version
-            if let dmg = release.assets.first(where: { $0.name.hasSuffix(".dmg") }) {
+            let preferredDMG = "BlueDOT-Manager-\(version).dmg"
+            let dmgAsset = release.assets.first(where: { $0.name == preferredDMG })
+                ?? release.assets.first(where: { $0.name.hasPrefix("BlueDOT-Manager") && $0.name.hasSuffix(".dmg") })
+                ?? release.assets.first(where: { $0.name.hasSuffix(".dmg") })
+            if let dmg = dmgAsset {
                 downloadURL = URL(string: dmg.browserDownloadURL)
             } else {
                 downloadURL = nil
@@ -260,42 +264,137 @@ final class UpdateController: ObservableObject {
         }
         isInstalling = true
         status = "Downloading v\(latestVersion)…"
-        defer { isInstalling = false }
 
         do {
-            let (dmgData, _) = try await URLSession.shared.data(from: downloadURL)
+            var request = URLRequest(url: downloadURL)
+            request.setValue("BlueDOT-Manager", forHTTPHeaderField: "User-Agent")
+            let (dmgData, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, (200 ... 299).contains(http.statusCode) else {
+                throw UpdateError.badHTTP((response as? HTTPURLResponse)?.statusCode ?? 0)
+            }
+            guard dmgData.count > 200_000 else {
+                throw UpdateError.downloadTooSmall
+            }
+
             let dmgPath = FileManager.default.temporaryDirectory
                 .appendingPathComponent("BlueDOT-Manager-\(latestVersion).dmg")
             try dmgData.write(to: dmgPath, options: .atomic)
 
             status = "Mounting installer…"
             let mountPoint = try mountDMG(at: dmgPath)
-            defer { try? detachDMG(at: mountPoint) }
 
             guard let appBundle = try findAppBundle(in: mountPoint) else {
-                status = "No .app found inside the DMG."
-                return
+                try? detachDMG(at: mountPoint)
+                throw UpdateError.noAppInDMG
             }
 
-            let dest = URL(fileURLWithPath: "/Applications").appendingPathComponent(appBundle.lastPathComponent)
-            status = "Installing to \(dest.path)…"
-            if FileManager.default.fileExists(atPath: dest.path) {
-                try FileManager.default.removeItem(at: dest)
+            let cacheRoot = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("BlueDOT-Manager-updates", isDirectory: true)
+            try FileManager.default.createDirectory(at: cacheRoot, withIntermediateDirectories: true)
+            let stagedApp = cacheRoot.appendingPathComponent(appBundle.lastPathComponent)
+            if FileManager.default.fileExists(atPath: stagedApp.path) {
+                try FileManager.default.removeItem(at: stagedApp)
             }
-            try FileManager.default.copyItem(at: appBundle, to: dest)
+            status = "Preparing v\(latestVersion)…"
+            try FileManager.default.copyItem(at: appBundle, to: stagedApp)
+            try detachDMG(at: mountPoint)
+            try? FileManager.default.removeItem(at: dmgPath)
 
-            status = "Installed v\(latestVersion). Restarting…"
-            relaunchInstalledApp(at: dest)
+            let destination = preferredInstallDestination(fallbackAppName: appBundle.lastPathComponent)
+            status = "Quitting to install into \(destination.path)…"
+            try launchPostQuitInstall(stagedApp: stagedApp, destination: destination)
+            isInstalling = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                NSApp.terminate(nil)
+            }
         } catch {
-            status = "Install failed: \(error.localizedDescription). You can install manually from GitHub Releases."
-            NSWorkspace.shared.open(AppUpdateConstants.releasesURL)
+            isInstalling = false
+            status = "Install failed: \(error.localizedDescription)"
         }
+    }
+
+    private enum UpdateError: LocalizedError {
+        case badHTTP(Int)
+        case downloadTooSmall
+        case noAppInDMG
+        case postQuitScriptFailed(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .badHTTP(let code): "Download failed (HTTP \(code))."
+            case .downloadTooSmall: "Download did not look like a release DMG."
+            case .noAppInDMG: "No .app found inside the DMG."
+            case .postQuitScriptFailed(let detail): "Could not start installer: \(detail)"
+            }
+        }
+    }
+
+    private func preferredInstallDestination(fallbackAppName: String) -> URL {
+        let running = Bundle.main.bundleURL
+        if running.path.hasSuffix(".app"),
+           FileManager.default.isWritableFile(atPath: running.deletingLastPathComponent().path) {
+            return running
+        }
+        return URL(fileURLWithPath: "/Applications").appendingPathComponent(fallbackAppName)
+    }
+
+    private func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private func launchPostQuitInstall(stagedApp: URL, destination: URL) throws {
+        let scriptURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("bluedot-install-\(UUID().uuidString).sh")
+        let logURL = FileManager.default.temporaryDirectory.appendingPathComponent("bluedot-install-last.log")
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let stagedPath = shellQuote(stagedApp.path)
+        let destPath = shellQuote(destination.path)
+        let logPath = shellQuote(logURL.path)
+        let cachePath = shellQuote(stagedApp.deletingLastPathComponent().path)
+        let scriptPath = shellQuote(scriptURL.path)
+
+        let script = """
+        #!/bin/bash
+        set -e
+        LOG=\(logPath)
+        STAGED=\(stagedPath)
+        DEST=\(destPath)
+        echo "BlueDOT Manager update started" > "$LOG"
+        echo "Waiting for pid \(pid)…" >> "$LOG"
+        for _ in $(seq 1 240); do
+          if ! kill -0 \(pid) 2>/dev/null; then break; fi
+          sleep 0.25
+        done
+        install_app() {
+          rm -rf "$DEST"
+          /usr/bin/ditto "$STAGED" "$DEST"
+        }
+        if ! install_app >> "$LOG" 2>&1; then
+          echo "Retrying with administrator privileges…" >> "$LOG"
+          INSTALL_CMD=$(printf '/bin/rm -rf %q && /usr/bin/ditto %q %q' "$DEST" "$STAGED" "$DEST")
+          /usr/bin/osascript -e "do shell script \"$INSTALL_CMD\" with administrator privileges" >> "$LOG" 2>&1
+        fi
+        /usr/bin/open "$DEST"
+        rm -rf \(cachePath)
+        rm -f \(scriptPath)
+        """
+
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        proc.arguments = [scriptURL.path]
+        proc.standardInput = FileHandle.nullDevice
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        try proc.run()
     }
 
     private func promptToInstall(version: String) {
         let alert = NSAlert()
         alert.messageText = "Update available"
-        alert.informativeText = "BlueDOT Manager v\(version) is available (you have v\(currentVersion))."
+        alert.informativeText = "BlueDOT Manager v\(version) is available (you have v\(currentVersion)). The app will download, quit, replace itself, and reopen."
         alert.addButton(withTitle: "Download & Install")
         alert.addButton(withTitle: "Later")
         alert.addButton(withTitle: "Release notes")
@@ -339,18 +438,16 @@ final class UpdateController: ObservableObject {
     }
 
     private func findAppBundle(in mountRoot: URL) throws -> URL? {
-        let items = try FileManager.default.contentsOfDirectory(at: mountRoot, includingPropertiesForKeys: nil)
-        return items.first { $0.pathExtension == "app" }
-    }
-
-    private func relaunchInstalledApp(at appURL: URL) {
-        let cfg = NSWorkspace.OpenConfiguration()
-        cfg.promptsUserIfNeeded = true
-        NSWorkspace.shared.openApplication(at: appURL, configuration: cfg) { _, _ in
-            DispatchQueue.main.async {
-                NSApp.terminate(nil)
-            }
+        let keys: [URLResourceKey] = [.isDirectoryKey]
+        let items = try FileManager.default.contentsOfDirectory(at: mountRoot, includingPropertiesForKeys: keys)
+        if let direct = items.first(where: { $0.pathExtension == "app" }) { return direct }
+        for item in items {
+            let isDir = (try? item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+            guard isDir, item.lastPathComponent != "Applications" else { continue }
+            let inner = try FileManager.default.contentsOfDirectory(at: item, includingPropertiesForKeys: nil)
+            if let nested = inner.first(where: { $0.pathExtension == "app" }) { return nested }
         }
+        return nil
     }
 
     static func isVersion(_ a: String, newerThan b: String) -> Bool {
