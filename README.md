@@ -10,10 +10,11 @@ Temperature format matches [artisan-websocket-bluedot](https://github.com/lamrog
 
 **No build tools required.**
 
-1. Download **[BlueDOT-Manager-1.2.0.dmg](https://github.com/hudsonfoo/thermoworks-bluedot-manager/releases/latest)** from [Releases](https://github.com/hudsonfoo/thermoworks-bluedot-manager/releases).
+1. Download the latest **BlueDOT-Manager-*.dmg** from [Releases](https://github.com/hudsonfoo/thermoworks-bluedot-manager/releases/latest).
 2. Open the DMG, drag **BlueDOT Manager** to **Applications**, launch it.
 3. Allow **Bluetooth** and **Notifications**.
 4. Turn on your BlueDOT — the app **finds it automatically** (no UUID hunting).
+5. **Settings → Updates** — check/install upgrades from GitHub (optional auto-check on launch).
 
 ### Live dashboard (pick one)
 

@@ -34,6 +34,7 @@ struct AppPreferences: Codable, Equatable {
     var ntfyServer: String
     var dashboardHosting: String
     var homeIngestPort: Int
+    var autoCheckUpdates: Bool
 
     static let defaults = AppPreferences(
         deviceUUID: "",
@@ -50,7 +51,8 @@ struct AppPreferences: Codable, Equatable {
         ntfyTopic: "",
         ntfyServer: "https://ntfy.sh",
         dashboardHosting: DashboardHosting.cloudflare.rawValue,
-        homeIngestPort: 8787
+        homeIngestPort: 8787,
+        autoCheckUpdates: true
     )
 
     init(
@@ -68,7 +70,8 @@ struct AppPreferences: Codable, Equatable {
         ntfyTopic: String = "",
         ntfyServer: String = "https://ntfy.sh",
         dashboardHosting: String = DashboardHosting.cloudflare.rawValue,
-        homeIngestPort: Int = 8787
+        homeIngestPort: Int = 8787,
+        autoCheckUpdates: Bool = true
     ) {
         self.deviceUUID = deviceUUID
         self.useCelsius = useCelsius
@@ -85,6 +88,7 @@ struct AppPreferences: Codable, Equatable {
         self.ntfyServer = ntfyServer
         self.dashboardHosting = dashboardHosting
         self.homeIngestPort = homeIngestPort
+        self.autoCheckUpdates = autoCheckUpdates
     }
 
     var hosting: DashboardHosting {
@@ -108,6 +112,218 @@ struct AppPreferences: Codable, Equatable {
         ntfyServer = try c.decodeIfPresent(String.self, forKey: .ntfyServer) ?? "https://ntfy.sh"
         dashboardHosting = try c.decodeIfPresent(String.self, forKey: .dashboardHosting) ?? DashboardHosting.cloudflare.rawValue
         homeIngestPort = try c.decodeIfPresent(Int.self, forKey: .homeIngestPort) ?? 8787
+        autoCheckUpdates = try c.decodeIfPresent(Bool.self, forKey: .autoCheckUpdates) ?? true
+    }
+}
+
+private enum AppUpdateConstants {
+    static let repo = "hudsonfoo/thermoworks-bluedot-manager"
+    static let releasesURL = URL(string: "https://github.com/hudsonfoo/thermoworks-bluedot-manager/releases")!
+}
+
+private struct GitHubRelease: Decodable {
+    let tagName: String
+    let htmlURL: String
+    let assets: [Asset]
+
+    struct Asset: Decodable {
+        let name: String
+        let browserDownloadURL: String
+
+        enum CodingKeys: String, CodingKey {
+            case name
+            case browserDownloadURL = "browser_download_url"
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case tagName = "tag_name"
+        case htmlURL = "html_url"
+        case assets
+    }
+}
+
+@MainActor
+final class UpdateController: ObservableObject {
+    @Published var status = ""
+    @Published var latestVersion: String?
+    @Published var downloadURL: URL?
+    @Published var isChecking = false
+    @Published var isInstalling = false
+
+    var currentVersion: String {
+        (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0"
+    }
+
+    var updateAvailable: Bool {
+        guard let latestVersion else { return false }
+        return Self.isVersion(latestVersion, newerThan: currentVersion)
+    }
+
+    func checkOnLaunchIfEnabled(autoCheck: Bool) {
+        guard autoCheck else { return }
+        Task {
+            await checkForUpdates(silent: true)
+            if updateAvailable, let latestVersion {
+                promptToInstall(version: latestVersion)
+            }
+        }
+    }
+
+    func checkForUpdates(silent: Bool = false) async {
+        guard !isChecking else { return }
+        isChecking = true
+        defer { isChecking = false }
+        if !silent { status = "Checking GitHub releases…" }
+
+        guard let api = URL(string: "https://api.github.com/repos/\(AppUpdateConstants.repo)/releases/latest") else {
+            status = "Invalid update URL"
+            return
+        }
+        var req = URLRequest(url: api)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.setValue("BlueDOT-Manager", forHTTPHeaderField: "User-Agent")
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: req)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                status = "Could not reach GitHub (status \((response as? HTTPURLResponse)?.statusCode ?? 0))"
+                return
+            }
+            let release = try JSONDecoder().decode(GitHubRelease.self, from: data)
+            let version = release.tagName.trimmingCharacters(in: CharacterSet(charactersIn: "vV"))
+            latestVersion = version
+            if let dmg = release.assets.first(where: { $0.name.hasSuffix(".dmg") }) {
+                downloadURL = URL(string: dmg.browserDownloadURL)
+            } else {
+                downloadURL = nil
+            }
+
+            if Self.isVersion(version, newerThan: currentVersion) {
+                status = "Update available: v\(version) (you have v\(currentVersion))"
+                if !silent {
+                    promptToInstall(version: version)
+                }
+            } else {
+                status = "BlueDOT Manager v\(currentVersion) is up to date."
+                latestVersion = nil
+                downloadURL = nil
+            }
+        } catch {
+            status = "Update check failed: \(error.localizedDescription)"
+        }
+    }
+
+    func installUpdate() async {
+        guard let downloadURL, let latestVersion else {
+            status = "No update downloaded yet — check for updates first."
+            return
+        }
+        isInstalling = true
+        status = "Downloading v\(latestVersion)…"
+        defer { isInstalling = false }
+
+        do {
+            let (dmgData, _) = try await URLSession.shared.data(from: downloadURL)
+            let dmgPath = FileManager.default.temporaryDirectory
+                .appendingPathComponent("BlueDOT-Manager-\(latestVersion).dmg")
+            try dmgData.write(to: dmgPath, options: .atomic)
+
+            status = "Mounting installer…"
+            let mountPoint = try mountDMG(at: dmgPath)
+            defer { try? detachDMG(at: mountPoint) }
+
+            guard let appBundle = try findAppBundle(in: mountPoint) else {
+                status = "No .app found inside the DMG."
+                return
+            }
+
+            let dest = URL(fileURLWithPath: "/Applications").appendingPathComponent(appBundle.lastPathComponent)
+            status = "Installing to \(dest.path)…"
+            if FileManager.default.fileExists(atPath: dest.path) {
+                try FileManager.default.removeItem(at: dest)
+            }
+            try FileManager.default.copyItem(at: appBundle, to: dest)
+
+            status = "Installed v\(latestVersion). Restarting…"
+            relaunchInstalledApp(at: dest)
+        } catch {
+            status = "Install failed: \(error.localizedDescription). You can install manually from GitHub Releases."
+            NSWorkspace.shared.open(AppUpdateConstants.releasesURL)
+        }
+    }
+
+    private func promptToInstall(version: String) {
+        let alert = NSAlert()
+        alert.messageText = "Update available"
+        alert.informativeText = "BlueDOT Manager v\(version) is available (you have v\(currentVersion))."
+        alert.addButton(withTitle: "Download & Install")
+        alert.addButton(withTitle: "Later")
+        alert.addButton(withTitle: "Release notes")
+        let result = alert.runModal()
+        if result == .alertFirstButtonReturn {
+            Task { await installUpdate() }
+        } else if result == .alertThirdButtonReturn {
+            NSWorkspace.shared.open(AppUpdateConstants.releasesURL)
+        }
+    }
+
+    private func mountDMG(at url: URL) throws -> URL {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+        proc.arguments = ["attach", url.path, "-nobrowse", "-quiet", "-plist"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        try proc.run()
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0 else { throw NSError(domain: "Update", code: 1, userInfo: [NSLocalizedDescriptionKey: "hdiutil attach failed"]) }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let plist = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              let entities = plist["system-entities"] as? [[String: Any]]
+        else { throw NSError(domain: "Update", code: 2, userInfo: [NSLocalizedDescriptionKey: "Could not parse mount info"]) }
+
+        for entity in entities {
+            if let mountPoint = entity["mount-point"] as? String {
+                return URL(fileURLWithPath: mountPoint)
+            }
+        }
+        throw NSError(domain: "Update", code: 3, userInfo: [NSLocalizedDescriptionKey: "No mount point"])
+    }
+
+    private func detachDMG(at mountPoint: URL) throws {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+        proc.arguments = ["detach", mountPoint.path, "-quiet"]
+        try proc.run()
+        proc.waitUntilExit()
+    }
+
+    private func findAppBundle(in mountRoot: URL) throws -> URL? {
+        let items = try FileManager.default.contentsOfDirectory(at: mountRoot, includingPropertiesForKeys: nil)
+        return items.first { $0.pathExtension == "app" }
+    }
+
+    private func relaunchInstalledApp(at appURL: URL) {
+        let cfg = NSWorkspace.OpenConfiguration()
+        cfg.promptsUserIfNeeded = true
+        NSWorkspace.shared.openApplication(at: appURL, configuration: cfg) { _, _ in
+            DispatchQueue.main.async {
+                NSApp.terminate(nil)
+            }
+        }
+    }
+
+    static func isVersion(_ a: String, newerThan b: String) -> Bool {
+        let pa = a.split(separator: ".").compactMap { Int($0) }
+        let pb = b.split(separator: ".").compactMap { Int($0) }
+        let n = max(pa.count, pb.count)
+        for i in 0..<n {
+            let va = i < pa.count ? pa[i] : 0
+            let vb = i < pb.count ? pb[i] : 0
+            if va != vb { return va > vb }
+        }
+        return false
     }
 }
 
@@ -1865,6 +2081,7 @@ private struct PublicScreen: View {
 
 private struct SettingsScreen: View {
     @EnvironmentObject var store: BluetoothStore
+    @EnvironmentObject var updater: UpdateController
 
     var body: some View {
         ZStack {
@@ -1972,6 +2189,30 @@ private struct SettingsScreen: View {
                     Toggle("Use Celsius", isOn: $store.prefs.useCelsius)
                     Toggle("Menu bar thermometer", isOn: $store.prefs.menuBarEnabled)
                 }
+                Section {
+                    LabeledContent("Installed version", value: updater.currentVersion)
+                    Toggle("Check for updates on launch", isOn: $store.prefs.autoCheckUpdates)
+                    Text(updater.status)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    HStack {
+                        Button(updater.isChecking ? "Checking…" : "Check for updates") {
+                            Task { await updater.checkForUpdates() }
+                        }
+                        .disabled(updater.isChecking || updater.isInstalling)
+                        if updater.updateAvailable {
+                            Button(updater.isInstalling ? "Installing…" : "Install update") {
+                                Task { await updater.installUpdate() }
+                            }
+                            .disabled(updater.isInstalling)
+                        }
+                        Button("GitHub releases") {
+                            NSWorkspace.shared.open(AppUpdateConstants.releasesURL)
+                        }
+                    }
+                } header: {
+                    Text("Updates")
+                }
                 Button("Save settings") { store.saveAll() }
                     .buttonStyle(.borderedProminent)
                     .tint(Theme.mint)
@@ -2063,16 +2304,19 @@ private struct RootView: View {
 struct BlueDOTManagerApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var store = BluetoothStore()
+    @StateObject private var updater = UpdateController()
 
     var body: some Scene {
         WindowGroup {
             RootView()
                 .environmentObject(store)
+                .environmentObject(updater)
                 .preferredColorScheme(.dark)
                 .onAppear {
                     appDelegate.bind(store: store)
                     if !appDelegate.didStart {
                         store.start()
+                        updater.checkOnLaunchIfEnabled(autoCheck: store.prefs.autoCheckUpdates)
                         appDelegate.didStart = true
                     }
                 }
