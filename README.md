@@ -2,8 +2,6 @@
 
 **ProbeBeacon** is a free, open-source **macOS Bluetooth meat thermometer app**: connect **MEATER**, **ThermoWorks BlueDOT**, **Thermapen Blue**, **Inkbird iBBQ**, and other BLE probes, stream live temps, track cooks, share a **public BBQ thermometer dashboard**, and get target alarms on your Mac or iPhone (ntfy).
 
-> Formerly distributed as “BlueDOT Manager” — same project, now built for multiple brands.
-
 ## Supported Bluetooth thermometers
 
 | Device | Driver in app | How it’s detected |
@@ -22,7 +20,7 @@ PRs welcome for more profiles — see [Contributing](#contributing).
 
 **No build tools required.**
 
-1. Download the latest **`ProbeBeacon-*.dmg`** from [Releases](https://github.com/hudsonfoo/thermoworks-bluedot-manager/releases/latest) (older assets may be named `BlueDOT-Manager-*.dmg`).
+1. Download the latest **`ProbeBeacon-*.dmg`** from [Releases](https://github.com/hudsonfoo/probe-beacon/releases/latest).
 2. Open the DMG and drag **ProbeBeacon** into **Applications**.
 3. **First launch** — macOS may say it can’t verify the app (not Apple-notarized). Either:
    - **Right-click** **ProbeBeacon** in Applications → **Open** → **Open** (once), or
@@ -42,8 +40,8 @@ Deploy the Worker in [Cloudflare setup](#cloudflare-https-recommended), then pas
 ## Build from source
 
 ```bash
-git clone git@github.com:hudsonfoo/thermoworks-bluedot-manager.git
-cd thermoworks-bluedot-manager
+git clone git@github.com:hudsonfoo/probe-beacon.git
+cd probe-beacon
 ./build-manager.sh
 open ProbeBeacon.app
 ```
@@ -87,13 +85,13 @@ In the Mac app **Settings → Live dashboard → Cloudflare**:
 
 ## Config on disk (not in git)
 
-Legacy folder name `bluedot-receiver` is unchanged for upgrades:
-
 | File | Purpose |
 |------|---------|
-| `~/.config/bluedot-receiver/config.json` | Ingest URL + token |
-| `~/.config/bluedot-receiver/preferences.json` | App prefs |
-| `~/.config/bluedot-receiver/cooks.json` | Cook history |
+| `~/.config/probe-beacon/config.json` | Ingest URL + token |
+| `~/.config/probe-beacon/preferences.json` | App prefs |
+| `~/.config/probe-beacon/cooks.json` | Cook history |
+
+On first launch, if you have an older `~/.config/bluedot-receiver/` folder, the app copies it into `probe-beacon` automatically.
 
 See `examples/`.
 

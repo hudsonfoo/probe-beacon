@@ -1,4 +1,4 @@
-name = "bluedot-live"
+name = "probe-beacon-live"
 main = "src/index.js"
 compatibility_date = "2024-11-01"
 workers_dev = true

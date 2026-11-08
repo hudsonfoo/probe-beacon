@@ -160,8 +160,8 @@ struct AppPreferences: Codable, Equatable {
 }
 
 private enum AppUpdateConstants {
-    static let repo = "hudsonfoo/thermoworks-bluedot-manager"
-    static let releasesURL = URL(string: "https://github.com/hudsonfoo/thermoworks-bluedot-manager/releases")!
+    static let repo = "hudsonfoo/probe-beacon"
+    static let releasesURL = URL(string: "https://github.com/hudsonfoo/probe-beacon/releases")!
 }
 
 private struct GitHubRelease: Decodable {
@@ -241,7 +241,6 @@ final class UpdateController: ObservableObject {
             let preferredDMG = "ProbeBeacon-\(version).dmg"
             let dmgAsset = release.assets.first(where: { $0.name == preferredDMG })
                 ?? release.assets.first(where: { $0.name.hasPrefix("ProbeBeacon") && $0.name.hasSuffix(".dmg") })
-                ?? release.assets.first(where: { $0.name.hasPrefix("BlueDOT-Manager") && $0.name.hasSuffix(".dmg") })
                 ?? release.assets.first(where: { $0.name.hasSuffix(".dmg") })
             if let dmg = dmgAsset {
                 downloadURL = URL(string: dmg.browserDownloadURL)
@@ -293,7 +292,7 @@ final class UpdateController: ObservableObject {
 
         do {
             var request = URLRequest(url: downloadURL)
-            request.setValue("BlueDOT-Manager", forHTTPHeaderField: "User-Agent")
+            request.setValue("ProbeBeacon", forHTTPHeaderField: "User-Agent")
             let (dmgData, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse, (200 ... 299).contains(http.statusCode) else {
                 throw UpdateError.badHTTP((response as? HTTPURLResponse)?.statusCode ?? 0)
@@ -315,7 +314,7 @@ final class UpdateController: ObservableObject {
             }
 
             let cacheRoot = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-                .appendingPathComponent("BlueDOT-Manager-updates", isDirectory: true)
+                .appendingPathComponent("ProbeBeacon-updates", isDirectory: true)
             try FileManager.default.createDirectory(at: cacheRoot, withIntermediateDirectories: true)
             let stagedApp = cacheRoot.appendingPathComponent(appBundle.lastPathComponent)
             if FileManager.default.fileExists(atPath: stagedApp.path) {
@@ -343,7 +342,7 @@ final class UpdateController: ObservableObject {
     }
 
     private func installLogPath() -> URL {
-        FileManager.default.temporaryDirectory.appendingPathComponent("bluedot-install-last.log")
+        FileManager.default.temporaryDirectory.appendingPathComponent("probebeacon-install-last.log")
     }
 
     private enum UpdateError: LocalizedError {
@@ -377,7 +376,7 @@ final class UpdateController: ObservableObject {
 
     private func launchPostQuitInstall(stagedApp: URL, destination: URL, logURL: URL) throws {
         let scriptURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("bluedot-install-\(UUID().uuidString).sh")
+            .appendingPathComponent("probebeacon-install-\(UUID().uuidString).sh")
         let pid = ProcessInfo.processInfo.processIdentifier
         let stagedPath = shellQuote(stagedApp.path)
         let destPath = shellQuote(destination.path)
@@ -449,7 +448,7 @@ final class UpdateController: ObservableObject {
     private func mountDMG(at url: URL) throws -> URL {
         // hdiutil attach -quiet -plist writes no stdout; use an explicit mount point instead.
         let mountPoint = FileManager.default.temporaryDirectory
-            .appendingPathComponent("BlueDOT-Manager-dmg-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("ProbeBeacon-dmg-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: mountPoint, withIntermediateDirectories: true)
 
         let proc = Process()
@@ -592,7 +591,7 @@ private enum NetworkEndpoints {
 
 // MARK: - Notifications & alarm audio
 
-private let targetAlarmCategoryId = "BLUEDOT_TARGET_ALARM"
+private let targetAlarmCategoryId = "PROBEBEACON_TARGET_ALARM"
 
 private final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     static let shared = NotificationDelegate()
@@ -620,7 +619,7 @@ private final class NotificationDelegate: NSObject, UNUserNotificationCenterDele
         _ center: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse
     ) async {
-        guard response.notification.request.identifier == "bluedot.target" else { return }
+        guard response.notification.request.identifier == "probebeacon.target" else { return }
         if response.actionIdentifier == "DISMISS_ALARM"
             || response.actionIdentifier == UNNotificationDefaultActionIdentifier {
             await MainActor.run {
@@ -820,8 +819,15 @@ struct ReadingRow: Identifiable, Equatable {
 
 private enum ConfigPaths {
     static var configDir: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config/bluedot-receiver", isDirectory: true)
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let newDir = home.appendingPathComponent(".config/probe-beacon", isDirectory: true)
+        let legacyDir = home.appendingPathComponent(".config/bluedot-receiver", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: newDir.path),
+           FileManager.default.fileExists(atPath: legacyDir.path) {
+            try? FileManager.default.createDirectory(at: newDir.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? FileManager.default.copyItem(at: legacyDir, to: newDir)
+        }
+        return newDir
     }
 
     static var ingestConfig: URL { configDir.appendingPathComponent("config.json") }
@@ -1130,8 +1136,8 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
         targetAlarmSnoozeUntil = nil
         AlarmSoundPlayer.shared.stop()
         MenuBarController.shared.sync(store: self)
-        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ["bluedot.target"])
-        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: ["bluedot.target"])
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ["probebeacon.target"])
+        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: ["probebeacon.target"])
     }
 
     func snoozeTargetAlarm(minutes: Int) {
@@ -1141,12 +1147,12 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
 
     func testNotifications() {
         notify(
-            identifier: "bluedot.test",
-            title: "BlueDOT test",
+            identifier: "probebeacon.test",
+            title: "ProbeBeacon test",
             body: "If you see this banner and hear a sound, Mac notifications are working.",
             urgent: false
         )
-        RemotePush.send(prefs: prefs, title: "BlueDOT test", body: "iPhone push path OK if you see this on ntfy.")
+        RemotePush.send(prefs: prefs, title: "ProbeBeacon test", body: "iPhone push path OK if you see this on ntfy.")
     }
 
     var menuBarStatusLine: String {
@@ -1398,7 +1404,7 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
 
     private func beginScanForAdditionalProbe() {
         scanningForMoreProbes = true
-        detailLine = "Scanning for another BlueDOT…"
+        detailLine = "Scanning for another probe…"
         guard let manager, manager.state == .poweredOn else { return }
         manager.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
     }
@@ -1743,7 +1749,7 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
             }
             return
         }
-        detailLine = "Scanning for BlueDOT…"
+        detailLine = "Scanning for thermometers…"
         manager.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
     }
 
@@ -2031,7 +2037,7 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
             let label = prefs.useCelsius
                 ? String(format: "%.0f °C", targetDisplayValue)
                 : String(format: "%.0f °F", prefs.targetTempF)
-            let probeName = slot.map { displayName(forProbeUUID: $0.uuid) } ?? "BlueDOT"
+            let probeName = slot.map { displayName(forProbeUUID: $0.uuid) } ?? "Probe"
             let body = "\(probeName) hit target · now \(label)"
             beginTargetAlarm(title: "Target temperature reached", body: body)
         } else if delta > 4 {
@@ -2055,7 +2061,7 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
 
     private func beginTargetAlarm(title: String, body: String) {
         AlarmSoundPlayer.shared.startRepeating()
-        notify(identifier: "bluedot.target", title: title, body: body, urgent: true, category: targetAlarmCategoryId)
+        notify(identifier: "probebeacon.target", title: title, body: body, urgent: true, category: targetAlarmCategoryId)
         RemotePush.send(prefs: prefs, title: title, body: body)
         MenuBarController.shared.sync(store: self)
     }

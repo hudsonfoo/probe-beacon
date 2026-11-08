@@ -7,15 +7,15 @@
 	<key>CFBundleExecutable</key>
 	<string>ProbeBeacon</string>
 	<key>CFBundleIdentifier</key>
-	<string>local.david.BlueDOTManager</string>
+	<string>local.david.ProbeBeacon</string>
 	<key>CFBundleName</key>
 	<string>ProbeBeacon</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.4.0</string>
+	<string>1.0.0</string>
 	<key>CFBundleVersion</key>
-	<string>11</string>
+	<string>1</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>

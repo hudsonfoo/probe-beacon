@@ -1,4 +1,4 @@
 {
-  "ingestURL": "https://bluedot-live.YOUR_SUBDOMAIN.workers.dev/api/ingest",
+  "ingestURL": "https://probe-beacon-live.YOUR_SUBDOMAIN.workers.dev/api/ingest",
   "token": "REPLACE_WITH_OPENSSL_RAND_HEX_32"
 }
