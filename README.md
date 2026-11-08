@@ -52,6 +52,8 @@ DMG: `./scripts/package-dmg.sh` → `build/ProbeBeacon-*.dmg`
 
 Credentials stay on the Worker (`INGEST_TOKEN`). Browsers only call `GET /api/reading`.
 
+The public page (`ingest-server/live-dashboard.js`, shared with the Worker) shows live temp (°F/°C), probe driver, cook title, target progress/ETA, session min/max, and a trend chart with a target line. Redeploy the Worker after pulling dashboard changes.
+
 ```bash
 cd public-worker
 npx wrangler login

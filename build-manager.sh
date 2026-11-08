@@ -12,7 +12,7 @@ swiftc -parse-as-library -O -o "$BIN" "$ROOT/ThermometerProfiles.swift" "$ROOT/P
 RES="$APP/Contents/Resources/ingest-server"
 rm -rf "$RES"
 mkdir -p "$RES"
-cp "$ROOT/ingest-server/server.js" "$ROOT/ingest-server/package.json" "$RES/"
+cp "$ROOT/ingest-server/server.js" "$ROOT/ingest-server/live-dashboard.js" "$ROOT/ingest-server/package.json" "$RES/"
 /usr/bin/codesign --force --deep --sign - \
   --entitlements "$ROOT/ProbeBeacon.entitlements" \
   --options runtime \

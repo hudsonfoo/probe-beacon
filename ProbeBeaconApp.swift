@@ -794,6 +794,14 @@ private struct IngestPayload: Codable {
     var connection: String
     var deviceName: String?
     var deviceUUID: String?
+    var profileName: String?
+    var cookTitle: String?
+    var targetEnabled: Bool?
+    var targetTempF: Double?
+    var targetEtaSeconds: Double?
+    var targetHeadline: String?
+    var sessionMinF: Double?
+    var sessionMaxF: Double?
 }
 
 struct ReadingRow: Identifiable, Equatable {
@@ -939,7 +947,16 @@ private final class Broadcaster {
         temperatureF: Double?,
         raw: Int32?,
         deviceName: String?,
-        deviceUUID: String?
+        deviceUUID: String?,
+        profileName: String?,
+        cookTitle: String?,
+        targetEnabled: Bool,
+        targetTempF: Double?,
+        targetEtaSeconds: Double?,
+        targetHeadline: String?,
+        sessionMinF: Double?,
+        sessionMaxF: Double?,
+        displayUnit: String
     ) {
         guard !paused else { return }
         guard let cfg = ConfigLoader.loadIngest(), let endpoint = URL(string: cfg.ingestURL) else {
@@ -954,22 +971,38 @@ private final class Broadcaster {
             self.lastPost = now
             payload = IngestPayload(
                 temperatureF: temperatureF,
-                unit: "F",
+                unit: displayUnit,
                 raw: raw ?? 0,
                 updatedAt: iso8601(now),
                 connection: connection,
                 deviceName: deviceName,
-                deviceUUID: deviceUUID
+                deviceUUID: deviceUUID,
+                profileName: profileName,
+                cookTitle: cookTitle,
+                targetEnabled: targetEnabled ? true : nil,
+                targetTempF: targetEnabled ? targetTempF : nil,
+                targetEtaSeconds: targetEtaSeconds,
+                targetHeadline: targetHeadline,
+                sessionMinF: sessionMinF,
+                sessionMaxF: sessionMaxF
             )
         } else {
             payload = IngestPayload(
                 temperatureF: -1,
-                unit: "F",
+                unit: displayUnit,
                 raw: 0,
                 updatedAt: iso8601(Date()),
                 connection: connection,
                 deviceName: deviceName,
-                deviceUUID: deviceUUID
+                deviceUUID: deviceUUID,
+                profileName: profileName,
+                cookTitle: cookTitle,
+                targetEnabled: targetEnabled ? true : nil,
+                targetTempF: targetEnabled ? targetTempF : nil,
+                targetEtaSeconds: targetEtaSeconds,
+                targetHeadline: targetHeadline,
+                sessionMinF: sessionMinF,
+                sessionMaxF: sessionMaxF
             )
         }
 
@@ -2083,16 +2116,42 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
         notify(identifier: UUID().uuidString, title: title, body: body, urgent: false)
     }
 
+    private func activeCookTitle(forProbeUUID uuid: String) -> String? {
+        guard let idx = activeCookSessionIndex(forProbe: uuid) else { return nil }
+        let cook = cookSessions[idx]
+        if let title = cook.title, !title.isEmpty { return title }
+        return cook.isActive ? cook.displayTitle : nil
+    }
+
+    private func targetBroadcastExtras() -> (etaSeconds: Double?, headline: String?) {
+        guard prefs.targetEnabled else { return (nil, nil) }
+        let headline = targetProjection.headline
+        if case .enRoute(let eta, _, _) = targetProjection {
+            return (eta, headline)
+        }
+        return (nil, headline)
+    }
+
     private func postBroadcast(temp: Double?, raw: Int32?, device: CBPeripheral? = nil) {
         let uuid = prefs.resolvedActiveProbeUUID
         let slot = probeSlots[uuid]
+        let extras = targetBroadcastExtras()
         broadcaster.post(
             paused: prefs.broadcastPaused,
             connection: connectionState,
             temperatureF: temp,
             raw: raw,
             deviceName: device?.name ?? slot?.displayName ?? displayName(forProbeUUID: uuid),
-            deviceUUID: device?.identifier.uuidString ?? (uuid.isEmpty ? nil : uuid)
+            deviceUUID: device?.identifier.uuidString ?? (uuid.isEmpty ? nil : uuid),
+            profileName: uuid.isEmpty ? nil : profileId(forProbeUUID: uuid).displayName,
+            cookTitle: uuid.isEmpty ? nil : activeCookTitle(forProbeUUID: uuid),
+            targetEnabled: prefs.targetEnabled,
+            targetTempF: prefs.targetEnabled ? prefs.targetTempF : nil,
+            targetEtaSeconds: extras.etaSeconds,
+            targetHeadline: prefs.targetEnabled ? extras.headline : nil,
+            sessionMinF: sessionMin,
+            sessionMaxF: sessionMax,
+            displayUnit: prefs.useCelsius ? "C" : "F"
         )
     }
 

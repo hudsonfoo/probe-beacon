@@ -1,10 +1,9 @@
-name = "probe-beacon-live"
+name = "bluedot-live"
 main = "src/index.js"
 compatibility_date = "2024-11-01"
+account_id = "31912e0b40c92653332467579dc8d563"
 workers_dev = true
 
-# Create your namespace: npx wrangler kv namespace create READINGS
-# Then paste the id below.
 [[kv_namespaces]]
 binding = "READINGS"
-id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+id = "28aecfdeed72444689e14e3e27fe54c6"
