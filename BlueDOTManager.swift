@@ -2323,6 +2323,15 @@ struct BlueDOTManagerApp: App {
         }
         .defaultSize(width: 960, height: 640)
         .windowStyle(.hiddenTitleBar)
+        .commands {
+            CommandGroup(after: .newItem) {
+                Button("Check for Updates…") {
+                    Task { await updater.checkForUpdates() }
+                }
+                .keyboardShortcut("u", modifiers: [.command, .shift])
+                .disabled(updater.isChecking || updater.isInstalling)
+            }
+        }
     }
 }
 
