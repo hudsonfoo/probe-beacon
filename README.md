@@ -104,6 +104,10 @@ See `examples/`.
 | Home server won’t start | Install Node; use release DMG (includes ingest-server in bundle) |
 | Public page empty | Token must match server; keep app running + probe connected |
 
+## Contributing
+
+**Pull requests are welcome.** Bug fixes, docs, Worker/dashboard improvements, and UX polish all help. Open an issue first if you’re planning a large change so we can align on direction.
+
 ## License
 
 MIT — [LICENSE](LICENSE)
