@@ -3,6 +3,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 APP="$ROOT/BlueDOTManager.app"
 BIN="$APP/Contents/MacOS/BlueDOTManager"
+if [[ -d "$ROOT/AppIcon.iconset" ]]; then
+  "$ROOT/scripts/build-app-icon.sh"
+fi
 swiftc -parse-as-library -O -o "$BIN" "$ROOT/BlueDOTManager.swift" \
   -framework SwiftUI -framework Charts -framework AppKit \
   -framework CoreBluetooth -framework UserNotifications
