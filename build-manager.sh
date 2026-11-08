@@ -6,7 +6,7 @@ BIN="$APP/Contents/MacOS/BlueDOTManager"
 if [[ -d "$ROOT/AppIcon.iconset" ]]; then
   "$ROOT/scripts/build-app-icon.sh"
 fi
-swiftc -parse-as-library -O -o "$BIN" "$ROOT/BlueDOTManager.swift" \
+swiftc -parse-as-library -O -o "$BIN" "$ROOT/ThermometerProfiles.swift" "$ROOT/BlueDOTManager.swift" \
   -framework SwiftUI -framework Charts -framework AppKit \
   -framework CoreBluetooth -framework UserNotifications
 RES="$APP/Contents/Resources/ingest-server"

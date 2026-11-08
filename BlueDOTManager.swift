@@ -7,8 +7,6 @@ import AudioToolbox
 import Darwin
 import Security
 
-private let defaultDeviceUUID = UUID(uuidString: "0B843D4E-A492-D46A-F05B-003EBA2B18DE")!
-private let tempCharacteristicUUID = CBUUID(string: "783F2991-23E0-4BDC-AC16-78601BD84B39")
 private let preferredLocalName = "BlueDOT"
 
 // MARK: - Models & config
@@ -24,6 +22,8 @@ struct AppPreferences: Codable, Equatable {
     var savedProbeUUIDs: [String]
     var activeProbeUUID: String
     var probeNames: [String: String]
+    /// peripheral UUID → thermometer profile id (see `ThermometerProfileID`)
+    var probeProfileIds: [String: String]
     var useCelsius: Bool
     var menuBarEnabled: Bool
     var broadcastPaused: Bool
@@ -45,6 +45,7 @@ struct AppPreferences: Codable, Equatable {
         savedProbeUUIDs: [],
         activeProbeUUID: "",
         probeNames: [:],
+        probeProfileIds: [:],
         useCelsius: false,
         menuBarEnabled: true,
         broadcastPaused: false,
@@ -81,6 +82,7 @@ struct AppPreferences: Codable, Equatable {
         savedProbeUUIDs: [String] = [],
         activeProbeUUID: String = "",
         probeNames: [String: String] = [:],
+        probeProfileIds: [String: String] = [:],
         useCelsius: Bool,
         menuBarEnabled: Bool,
         broadcastPaused: Bool,
@@ -101,6 +103,7 @@ struct AppPreferences: Codable, Equatable {
         self.savedProbeUUIDs = savedProbeUUIDs
         self.activeProbeUUID = activeProbeUUID.isEmpty ? deviceUUID : activeProbeUUID
         self.probeNames = probeNames
+        self.probeProfileIds = probeProfileIds
         self.useCelsius = useCelsius
         self.menuBarEnabled = menuBarEnabled
         self.broadcastPaused = broadcastPaused
@@ -128,6 +131,7 @@ struct AppPreferences: Codable, Equatable {
         savedProbeUUIDs = try c.decodeIfPresent([String].self, forKey: .savedProbeUUIDs) ?? []
         activeProbeUUID = try c.decodeIfPresent(String.self, forKey: .activeProbeUUID) ?? ""
         probeNames = try c.decodeIfPresent([String: String].self, forKey: .probeNames) ?? [:]
+        probeProfileIds = try c.decodeIfPresent([String: String].self, forKey: .probeProfileIds) ?? [:]
         if savedProbeUUIDs.isEmpty, !deviceUUID.isEmpty {
             savedProbeUUIDs = [deviceUUID]
         }
@@ -986,17 +990,6 @@ private final class Broadcaster {
     }
 }
 
-private func parseTemperatureF(from data: Data) -> (fahrenheit: Double, raw: Int32)? {
-    let bytes = [UInt8](data)
-    guard bytes.count >= 5 else { return nil }
-    let raw =
-        Int32(bytes[1]) |
-        (Int32(bytes[2]) << 8) |
-        (Int32(bytes[3]) << 16) |
-        (Int32(bytes[4]) << 24)
-    return (Double(raw), raw)
-}
-
 // MARK: - Theme
 
 private enum Theme {
@@ -1035,10 +1028,16 @@ struct ProbeSummary: Identifiable, Equatable {
 private final class ProbeSlot {
     let uuid: String
     var peripheral: CBPeripheral?
-    var tempCharacteristic: CBCharacteristic?
+    var profileId: String = ThermometerProfileID.thermoworksBluedot.rawValue
+    var notifyCharacteristics: [CBUUID: CBCharacteristic] = [:]
+    var boundCharacteristicUUID: CBUUID?
+    var lockedHeuristicMethod: String?
+    var inkbirdChannel: Int = 0
+    var gattSetupComplete = false
     var connectionState = "connecting"
     var displayName: String?
     var lastTemperature: Double?
+    var lastDecodeDetail: String?
     var lastRaw: Int32?
     var lastRSSI: Int?
     var lastUpdated: Date?
@@ -1083,6 +1082,7 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
     private var scanningForMoreProbes = false
     private var pairingBaselineUUIDs: Set<String> = []
     private var pairingTimeoutWorkItem: DispatchWorkItem?
+    @Published var pairingPreferredProfile: ThermometerProfileID = .autoDetect
     private let broadcaster = Broadcaster()
     private var targetAlarmSnoozeUntil: Date?
     private var pulsePhase = false
@@ -1201,10 +1201,108 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
         }
     }
 
+    func profileId(forProbeUUID uuid: String) -> ThermometerProfileID {
+        let raw = prefs.probeProfileIds[uuid] ?? probeSlots[uuid]?.profileId ?? ThermometerProfileID.thermoworksBluedot.rawValue
+        return ThermometerProfileRegistry.profile(for: raw)
+    }
+
     func displayName(forProbeUUID uuid: String) -> String {
         if let custom = prefs.probeNames[uuid], !custom.isEmpty { return custom }
         if let slot = probeSlots[uuid], let n = slot.displayName, !n.isEmpty { return n }
-        return "BlueDOT"
+        return profileId(forProbeUUID: uuid).displayName
+    }
+
+    private func looksLikeThermometer(name: String, advertisementServiceUUIDs: [CBUUID]) -> Bool {
+        let n = name.lowercased()
+        if n.contains("therm") || n.contains("meat") || n.contains("ink") || n.contains("bbq")
+            || n.contains("bluedot") || n.contains("ibt") || n.contains("idt") || n.contains("dot") {
+            return true
+        }
+        for s in advertisementServiceUUIDs {
+            let u = s.uuidString.uppercased()
+            if u.contains("1809") || u.contains("181A") || u.contains("FFF0") || u.contains("A75CC7FC") {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func decodeReading(slot: ProbeSlot, characteristic: CBCharacteristic, data: Data) -> TemperatureDecodeResult? {
+        let profile = ThermometerProfileRegistry.profile(for: slot.profileId)
+        if let bound = slot.boundCharacteristicUUID, bound == characteristic.uuid {
+            if profile == .autoDetect, let locked = slot.lockedHeuristicMethod,
+               let r = TemperatureDecoders.bestHeuristic(data: data) {
+                if r.detail?.contains(locked) == true || locked.hasPrefix("Auto") { return r }
+            }
+        }
+        if profile == .inkbirdIBBQ {
+            return TemperatureDecoders.decode(
+                profileId: .inkbirdIBBQ,
+                characteristic: characteristic.uuid,
+                data: data
+            )
+        }
+        if let decoded = TemperatureDecoders.decode(profileId: profile, characteristic: characteristic.uuid, data: data) {
+            return decoded
+        }
+        if profile == .autoDetect || slot.profileId == ThermometerProfileID.autoDetect.rawValue {
+            if let r = TemperatureDecoders.bestHeuristic(data: data) {
+                slot.lockedHeuristicMethod = r.detail
+                slot.boundCharacteristicUUID = characteristic.uuid
+                return r
+            }
+        }
+        if profile != .autoDetect, let r = TemperatureDecoders.bestHeuristic(data: data) {
+            return r
+        }
+        return nil
+    }
+
+    private func configureGATT(for peripheral: CBPeripheral, slot: ProbeSlot) {
+        let profile = ThermometerProfileRegistry.profile(for: slot.profileId)
+        let plan = ThermometerGATTPlanner.plan(for: profile)
+        guard let services = peripheral.services else { return }
+
+        for service in services {
+            for command in plan.writeCommands {
+                if let c = service.characteristics?.first(where: { $0.uuid == command.uuid }) {
+                    peripheral.writeValue(command.payload, for: c, type: .withResponse)
+                }
+            }
+        }
+
+        var toSubscribe: [CBCharacteristic] = []
+        for service in services {
+            guard let chars = service.characteristics else { continue }
+            for c in chars {
+                if plan.notifyUUIDs.contains(c.uuid) {
+                    toSubscribe.append(c)
+                    slot.notifyCharacteristics[c.uuid] = c
+                } else if profile == .autoDetect, ThermometerGATTPlanner.shouldSubscribeAuto(characteristic: c) {
+                    let u = c.uuid.uuidString.uppercased()
+                    if u.hasSuffix("2A1C") || u.hasSuffix("2A6E") || u.hasSuffix("2A1F")
+                        || u == GATTUUID.bluedotTemp.uuidString.uppercased()
+                        || u.hasSuffix("FFF4") || u == GATTUUID.meaterTemp.uuidString.uppercased() {
+                        toSubscribe.append(c)
+                        slot.notifyCharacteristics[c.uuid] = c
+                    }
+                }
+            }
+        }
+
+        for c in plan.readUUIDs.compactMap({ uuid in slot.notifyCharacteristics[uuid] ?? peripheral.services?.flatMap { $0.characteristics ?? [] }.first { $0.uuid == uuid } }) {
+            peripheral.readValue(for: c)
+        }
+
+        guard !toSubscribe.isEmpty else {
+            detailLine = "No temperature characteristics found for \(profile.displayName)"
+            return
+        }
+        for c in toSubscribe {
+            peripheral.setNotifyValue(true, for: c)
+        }
+        slot.gattSetupComplete = true
+        detailLine = "Streaming (\(profile.displayName))"
     }
 
     func selectProbe(_ uuid: String) {
@@ -1328,8 +1426,13 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
     }
 
     private func ensureProbeSlotsFromPrefs() {
-        for uuid in prefs.savedProbeUUIDs where probeSlots[uuid] == nil {
-            probeSlots[uuid] = ProbeSlot(uuid: uuid)
+        for uuid in prefs.savedProbeUUIDs {
+            let slot = ensureSlot(for: uuid)
+            if let saved = prefs.probeProfileIds[uuid] {
+                slot.profileId = saved
+            } else if prefs.probeProfileIds.isEmpty {
+                slot.profileId = ThermometerProfileID.thermoworksBluedot.rawValue
+            }
         }
         refreshProbeSummaries()
         syncPublishedFromActiveProbe()
@@ -1523,7 +1626,9 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
             slot.reconnectWorkItem?.cancel()
             if let p = slot.peripheral, let manager { manager.cancelPeripheralConnection(p) }
             slot.peripheral = nil
-            slot.tempCharacteristic = nil
+            slot.notifyCharacteristics.removeAll()
+            slot.boundCharacteristicUUID = nil
+            slot.gattSetupComplete = false
             slot.connectionState = "connecting"
         }
         syncPublishedFromActiveProbe()
@@ -1535,7 +1640,8 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
             slot.reconnectWorkItem?.cancel()
             if let p = slot.peripheral, let manager { manager.cancelPeripheralConnection(p) }
             slot.peripheral = nil
-            slot.tempCharacteristic = nil
+            slot.notifyCharacteristics.removeAll()
+            slot.gattSetupComplete = false
             slot.connectionState = "disconnected"
         }
         manager?.stopScan()
@@ -1550,7 +1656,8 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
         slot.reconnectWorkItem?.cancel()
         if let p = slot.peripheral, let manager { manager.cancelPeripheralConnection(p) }
         slot.peripheral = nil
-        slot.tempCharacteristic = nil
+        slot.notifyCharacteristics.removeAll()
+        slot.gattSetupComplete = false
         slot.connectionState = "disconnected"
     }
 
@@ -1639,23 +1746,21 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
         manager.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
     }
 
-    func rememberDiscoveredProbe(_ peripheral: CBPeripheral, name: String) {
+    func rememberDiscoveredProbe(_ peripheral: CBPeripheral, name: String, profileId: ThermometerProfileID) {
         let uuid = peripheral.identifier.uuidString
         let slot = ensureSlot(for: uuid)
         if !name.isEmpty { slot.displayName = name }
-        var changed = false
+        slot.profileId = profileId.rawValue
+        prefs.probeProfileIds[uuid] = profileId.rawValue
         if !prefs.savedProbeUUIDs.contains(uuid) {
             prefs.savedProbeUUIDs.append(uuid)
-            changed = true
             if prefs.activeProbeUUID.isEmpty {
                 prefs.activeProbeUUID = uuid
                 prefs.deviceUUID = uuid
             }
         }
-        if changed {
-            try? ConfigLoader.savePreferences(prefs)
-            refreshProbeSummaries()
-        }
+        try? ConfigLoader.savePreferences(prefs)
+        refreshProbeSummaries()
     }
 
     func refreshNetworkAddresses() {
@@ -1721,11 +1826,26 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
         Task { @MainActor in
             let uuid = p.identifier.uuidString
             let name = p.name ?? (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? ""
+            let advServices = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
             let savedSet = Set(prefs.savedProbeUUIDs)
             let isKnown = savedSet.contains(uuid)
-            let looksLikeBlueDOT = name == preferredLocalName || name.lowercased().contains("bluedot")
             let allowNew = scanningForMoreProbes || prefs.savedProbeUUIDs.isEmpty
-            guard isKnown || (looksLikeBlueDOT && allowNew) else { return }
+            let preferred = probePairingPresented ? pairingPreferredProfile : nil
+            let inferred = ThermometerProfileRegistry.inferProfile(
+                peripheralName: name,
+                advertisementServiceUUIDs: advServices,
+                preferred: preferred
+            )
+            let profileMatch = inferred != .autoDetect
+            let autoPair = probePairingPresented && pairingPreferredProfile == .autoDetect && allowNew
+                && looksLikeThermometer(name: name, advertisementServiceUUIDs: advServices)
+            let looksLikeBlueDOT = name == preferredLocalName || name.lowercased().contains("bluedot")
+            guard isKnown || profileMatch || (looksLikeBlueDOT && allowNew) || autoPair else { return }
+            let assignedProfile: ThermometerProfileID = {
+                if isKnown { return profileId(forProbeUUID: uuid) }
+                if probePairingPresented, pairingPreferredProfile != .autoDetect { return pairingPreferredProfile }
+                return inferred
+            }()
 
             let slot = ensureSlot(for: uuid)
             slot.lastRSSI = rssi.intValue
@@ -1733,7 +1853,7 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
             if scanningForMoreProbes, isNewProbe {
                 markProbePairingFound(peripheral: p, name: name)
             }
-            rememberDiscoveredProbe(p, name: name)
+            rememberDiscoveredProbe(p, name: name, profileId: assignedProfile)
 
             if slot.peripheral?.identifier == p.identifier, slot.connectionState == "connected" {
                 refreshProbeSummaries()
@@ -1781,7 +1901,8 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
             slot.connectionState = "disconnected"
             detailLine = error?.localizedDescription ?? "Connection failed"
             slot.peripheral = nil
-            slot.tempCharacteristic = nil
+            slot.notifyCharacteristics.removeAll()
+            slot.gattSetupComplete = false
             if uuid == prefs.resolvedActiveProbeUUID {
                 postBroadcast(temp: nil, raw: nil, device: p)
             }
@@ -1799,7 +1920,8 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
                 detailLine = error?.localizedDescription ?? "Disconnected — reconnecting…"
             }
             slot.peripheral = nil
-            slot.tempCharacteristic = nil
+            slot.notifyCharacteristics.removeAll()
+            slot.gattSetupComplete = false
             if uuid == prefs.resolvedActiveProbeUUID {
                 postBroadcast(temp: nil, raw: nil, device: p)
             }
@@ -1815,35 +1937,30 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
                 manager?.cancelPeripheralConnection(peripheral)
                 return
             }
-            peripheral.services?.forEach { peripheral.discoverCharacteristics([tempCharacteristicUUID], for: $0) }
+            peripheral.services?.forEach { peripheral.discoverCharacteristics(nil, for: $0) }
         }
     }
 
     nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         Task { @MainActor in
-            guard error == nil,
-                  let temp = service.characteristics?.first(where: { $0.uuid == tempCharacteristicUUID }),
-                  let slot = slot(for: peripheral)
-            else { return }
-            slot.tempCharacteristic = temp
-            if peripheral.identifier.uuidString == prefs.resolvedActiveProbeUUID {
-                detailLine = "Streaming temperature"
-            }
-            peripheral.setNotifyValue(true, for: temp)
+            guard error == nil, let slot = slot(for: peripheral) else { return }
+            guard peripheral.services?.allSatisfy({ $0.characteristics != nil }) == true else { return }
+            guard !slot.gattSetupComplete else { return }
+            configureGATT(for: peripheral, slot: slot)
         }
     }
 
     nonisolated func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         Task { @MainActor in
             guard error == nil,
-                  characteristic.uuid == tempCharacteristicUUID,
                   let data = characteristic.value,
-                  let parsed = parseTemperatureF(from: data),
-                  let slot = slot(for: peripheral)
+                  let slot = slot(for: peripheral),
+                  let parsed = decodeReading(slot: slot, characteristic: characteristic, data: data)
             else { return }
             let uuid = peripheral.identifier.uuidString
             slot.lastTemperature = parsed.fahrenheit
             slot.lastRaw = parsed.raw
+            slot.lastDecodeDetail = parsed.detail
             slot.lastUpdated = Date()
             if uuid == prefs.resolvedActiveProbeUUID {
                 withAnimation(.spring(response: 0.45, dampingFraction: 0.85)) {
@@ -1857,6 +1974,19 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
             if uuid == prefs.resolvedActiveProbeUUID {
                 postBroadcast(temp: parsed.fahrenheit, raw: parsed.raw, device: peripheral)
             }
+        }
+    }
+
+    func setProbeProfile(_ uuid: String, profile: ThermometerProfileID) {
+        prefs.probeProfileIds[uuid] = profile.rawValue
+        probeSlots[uuid]?.profileId = profile.rawValue
+        probeSlots[uuid]?.gattSetupComplete = false
+        saveAll()
+        refreshProbeSummaries()
+        if let p = probeSlots[uuid]?.peripheral {
+            p.discoverServices(nil)
+        } else {
+            reconnect()
         }
     }
 
@@ -2708,7 +2838,7 @@ private struct ProbePairingSheet: View {
                     .foregroundStyle(store.probePairingSucceeded ? Theme.mint : Theme.sky)
                     .symbolEffect(.pulse, options: store.probePairingSucceeded ? .default : .repeating)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(store.probePairingSucceeded ? "BlueDOT added" : "Add a BlueDOT")
+                    Text(store.probePairingSucceeded ? "Thermometer added" : "Add thermometer")
                         .font(.title2.weight(.bold))
                     Text(store.probePairingStatus)
                         .font(.callout)
@@ -2717,10 +2847,22 @@ private struct ProbePairingSheet: View {
             }
 
             if !store.probePairingSucceeded {
+                Picker("Type", selection: $store.pairingPreferredProfile) {
+                    ForEach(ThermometerProfileID.allCases) { profile in
+                        Text(profile.displayName).tag(profile)
+                    }
+                }
+                .pickerStyle(.menu)
+                Text(store.pairingPreferredProfile.pairingHint)
+                    .font(.caption)
+                    .foregroundStyle(Theme.muted)
+
                 VStack(alignment: .leading, spacing: 10) {
-                    pairingStep("1", "On your BlueDOT", "Press the power button until the display wakes up.")
-                    pairingStep("2", "Stay close", "Keep the probe within a few feet of this Mac.")
-                    pairingStep("3", "Wait", "We’ll connect automatically when it appears.")
+                    pairingStep("1", "Power on", "Wake the thermometer (probe button, lid, or charger).")
+                    pairingStep("2", "Stay close", "Keep it within a few feet of this Mac.")
+                    pairingStep("3", "Wait", store.pairingPreferredProfile == .autoDetect
+                        ? "We’ll connect and infer the temperature format from BLE data."
+                        : "We’ll connect when it appears in the scan.")
                 }
                 .padding(16)
                 .background(Theme.panel, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
@@ -2848,6 +2990,16 @@ private struct SettingsScreen: View {
                                     get: { store.prefs.probeNames[probe.uuid] ?? probe.name },
                                     set: { store.renameProbe(probe.uuid, name: $0) }
                                 ))
+                                Picker("Driver", selection: Binding(
+                                    get: { store.profileId(forProbeUUID: probe.uuid) },
+                                    set: { store.setProbeProfile(probe.uuid, profile: $0) }
+                                )) {
+                                    ForEach(ThermometerProfileID.allCases) { profile in
+                                        Text(profile.displayName).tag(profile)
+                                    }
+                                }
+                                .labelsHidden()
+                                .pickerStyle(.menu)
                                 Text(probe.uuid)
                                     .font(.caption2.monospaced())
                                     .foregroundStyle(.secondary)
@@ -2869,7 +3021,7 @@ private struct SettingsScreen: View {
                         }
                     }
                     HStack {
-                        Button("Add BlueDOT…") { store.startProbePairing() }
+                        Button("Add thermometer…") { store.startProbePairing() }
                         Button("Reconnect all") { store.reconnect() }
                     }
                 } header: {
