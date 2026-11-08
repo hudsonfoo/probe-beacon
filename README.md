@@ -11,10 +11,19 @@ Stream BLE readings to a **public dashboard**, track **cooks**, **target ETA**, 
 **No build tools required.**
 
 1. Download the latest **BlueDOT-Manager-*.dmg** from [Releases](https://github.com/hudsonfoo/thermoworks-bluedot-manager/releases/latest).
-2. Open the DMG, drag **BlueDOT Manager** to **Applications**, launch it.
-3. Allow **Bluetooth** and **Notifications**.
-4. Turn on your BlueDOT — the app **finds it automatically** (no UUID hunting).
-5. **Settings → Updates** — check/install upgrades from GitHub (optional auto-check on launch).
+2. Open the DMG and drag **BlueDOT Manager** into the **Applications** folder.
+3. **First launch only** — macOS may say it can’t verify the app (open-source builds aren’t Apple-notarized). Use either method:
+   - **Easiest:** In **Finder → Applications**, **right-click** (or Control-click) **BlueDOT Manager** → **Open** → click **Open** in the dialog. You only need to do this once; after that, double-click works.
+   - **Or:** Open **Terminal** and run (adjust the path if needed):
+     ```bash
+     xattr -dr com.apple.quarantine "/Applications/BlueDOT Manager.app"
+     ```
+     Then open the app normally from Applications.
+4. Allow **Bluetooth** and **Notifications** when prompted.
+5. Turn on your BlueDOT — the app **finds it automatically** (no UUID hunting).
+6. **Settings → Updates** or **File → Check for Updates…** — in-app upgrades from GitHub (optional auto-check on launch).
+
+> **Why the security message?** Release builds are signed for local use but not notarized with Apple. The app is open source on GitHub; the right-click **Open** path is Apple’s standard way to approve a downloaded app you trust.
 
 ### Live dashboard (pick one)
 
@@ -71,7 +80,7 @@ The Mac app always ingests to `http://127.0.0.1:<port>/api/ingest` locally; visi
 
 ## Features
 
-- Auto-discovery of **BlueDOT** by name (UUID saved after first connect); **multiple probes** (Settings → Add probe)
+- Auto-discovery of **BlueDOT** by name (UUID saved after first connect); **multiple probes** (Settings → **Add BlueDOT…**)
 - **Cooks** in `~/.config/bluedot-receiver/cooks.json` (24h gap → new cook, titles, manual **New cook**)
 - Target **ETA**, **alarm** with dismiss/snooze, menu bar, ntfy iPhone push
 
@@ -89,6 +98,7 @@ See `examples/`.
 
 | Issue | Fix |
 |--------|-----|
+| “Apple could not verify…” / app won’t open | First launch: **right-click → Open** in Applications (see [Quick start](#quick-start-download)), or clear quarantine with `xattr -dr com.apple.quarantine` on the `.app` |
 | Bluetooth prompt every rebuild | Use the **release DMG** or `./build-manager.sh`; allow once in System Settings |
 | Wrong temperature (÷10) | Fixed in 1.1+ — raw int is °F |
 | Home server won’t start | Install Node; use release DMG (includes ingest-server in bundle) |
