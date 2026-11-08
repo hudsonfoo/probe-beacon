@@ -1,0 +1,15 @@
+{
+  "deviceUUID": "0B843D4E-A492-D46A-F05B-003EBA2B18DE",
+  "useCelsius": false,
+  "menuBarEnabled": true,
+  "broadcastPaused": false,
+  "alertEnabled": false,
+  "alertHighF": 165,
+  "alertLowF": 40,
+  "targetEnabled": false,
+  "targetTempF": 203,
+  "targetAlarmEnabled": true,
+  "ntfyEnabled": false,
+  "ntfyTopic": "",
+  "ntfyServer": "https://ntfy.sh"
+}

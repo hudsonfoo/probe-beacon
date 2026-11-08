@@ -1,0 +1,10 @@
+name = "bluedot-live"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+workers_dev = true
+
+# Create your namespace: npx wrangler kv namespace create READINGS
+# Then paste the id below.
+[[kv_namespaces]]
+binding = "READINGS"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
