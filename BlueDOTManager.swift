@@ -19,7 +19,11 @@ struct IngestConfig: Codable, Equatable {
 }
 
 struct AppPreferences: Codable, Equatable {
+    /// Legacy primary probe; kept in sync with `activeProbeUUID` on save.
     var deviceUUID: String
+    var savedProbeUUIDs: [String]
+    var activeProbeUUID: String
+    var probeNames: [String: String]
     var useCelsius: Bool
     var menuBarEnabled: Bool
     var broadcastPaused: Bool
@@ -38,6 +42,9 @@ struct AppPreferences: Codable, Equatable {
 
     static let defaults = AppPreferences(
         deviceUUID: "",
+        savedProbeUUIDs: [],
+        activeProbeUUID: "",
+        probeNames: [:],
         useCelsius: false,
         menuBarEnabled: true,
         broadcastPaused: false,
@@ -55,8 +62,25 @@ struct AppPreferences: Codable, Equatable {
         autoCheckUpdates: true
     )
 
+    var resolvedActiveProbeUUID: String {
+        if !activeProbeUUID.isEmpty { return activeProbeUUID }
+        if !deviceUUID.isEmpty { return deviceUUID }
+        return savedProbeUUIDs.first ?? ""
+    }
+
+    mutating func syncLegacyDeviceUUID() {
+        activeProbeUUID = resolvedActiveProbeUUID
+        deviceUUID = activeProbeUUID
+        if !activeProbeUUID.isEmpty, !savedProbeUUIDs.contains(activeProbeUUID) {
+            savedProbeUUIDs.append(activeProbeUUID)
+        }
+    }
+
     init(
         deviceUUID: String,
+        savedProbeUUIDs: [String] = [],
+        activeProbeUUID: String = "",
+        probeNames: [String: String] = [:],
         useCelsius: Bool,
         menuBarEnabled: Bool,
         broadcastPaused: Bool,
@@ -74,6 +98,9 @@ struct AppPreferences: Codable, Equatable {
         autoCheckUpdates: Bool = true
     ) {
         self.deviceUUID = deviceUUID
+        self.savedProbeUUIDs = savedProbeUUIDs
+        self.activeProbeUUID = activeProbeUUID.isEmpty ? deviceUUID : activeProbeUUID
+        self.probeNames = probeNames
         self.useCelsius = useCelsius
         self.menuBarEnabled = menuBarEnabled
         self.broadcastPaused = broadcastPaused
@@ -98,6 +125,18 @@ struct AppPreferences: Codable, Equatable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         deviceUUID = try c.decode(String.self, forKey: .deviceUUID)
+        savedProbeUUIDs = try c.decodeIfPresent([String].self, forKey: .savedProbeUUIDs) ?? []
+        activeProbeUUID = try c.decodeIfPresent(String.self, forKey: .activeProbeUUID) ?? ""
+        probeNames = try c.decodeIfPresent([String: String].self, forKey: .probeNames) ?? [:]
+        if savedProbeUUIDs.isEmpty, !deviceUUID.isEmpty {
+            savedProbeUUIDs = [deviceUUID]
+        }
+        if activeProbeUUID.isEmpty, !deviceUUID.isEmpty {
+            activeProbeUUID = deviceUUID
+        }
+        if !activeProbeUUID.isEmpty {
+            deviceUUID = activeProbeUUID
+        }
         useCelsius = try c.decode(Bool.self, forKey: .useCelsius)
         menuBarEnabled = try c.decode(Bool.self, forKey: .menuBarEnabled)
         broadcastPaused = try c.decode(Bool.self, forKey: .broadcastPaused)
@@ -666,6 +705,7 @@ private struct CookArchiveFile: Codable {
 struct CookSession: Codable, Identifiable, Equatable {
     let id: UUID
     var title: String?
+    var probeUUID: String?
     var startedAt: Date
     var endedAt: Date?
     var readings: [StoredReading]
@@ -851,6 +891,34 @@ private enum Theme {
 
 // MARK: - Bluetooth store
 
+struct ProbeSummary: Identifiable, Equatable {
+    var id: String { uuid }
+    let uuid: String
+    var name: String
+    var connectionState: String
+    var lastTemperature: Double?
+    var lastUpdated: Date?
+    var lastRSSI: Int?
+}
+
+private final class ProbeSlot {
+    let uuid: String
+    var peripheral: CBPeripheral?
+    var tempCharacteristic: CBCharacteristic?
+    var connectionState = "connecting"
+    var displayName: String?
+    var lastTemperature: Double?
+    var lastRaw: Int32?
+    var lastRSSI: Int?
+    var lastUpdated: Date?
+    var highAlertSent = false
+    var lowAlertSent = false
+    var targetAlarmSent = false
+    var reconnectWorkItem: DispatchWorkItem?
+
+    init(uuid: String) { self.uuid = uuid }
+}
+
 final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     @Published var prefs: AppPreferences
     @Published var ingest = IngestConfig(ingestURL: "", token: "")
@@ -872,16 +940,13 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
     @Published var publicIPv4: String?
     @Published var localIPv4: String?
     @Published var homeIngestStatus = ""
+    @Published var probeSummaries: [ProbeSummary] = []
 
     private var manager: CBCentralManager!
     private let localIngest = LocalIngestServer()
-    private var peripheral: CBPeripheral?
-    private var tempCharacteristic: CBCharacteristic?
-    private var reconnectWorkItem: DispatchWorkItem?
+    private var probeSlots: [String: ProbeSlot] = [:]
+    private var scanningForMoreProbes = false
     private let broadcaster = Broadcaster()
-    private var highAlertSent = false
-    private var lowAlertSent = false
-    private var targetAlarmSent = false
     private var targetAlarmSnoozeUntil: Date?
     private var pulsePhase = false
     private var didStartBluetooth = false
@@ -916,7 +981,9 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
         } else {
             prefs.targetTempF = value
         }
-        targetAlarmSent = false
+        if let slot = probeSlots[prefs.resolvedActiveProbeUUID] {
+            slot.targetAlarmSent = false
+        }
         targetAlarmRinging = false
     }
 
@@ -960,6 +1027,7 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
         prefs = ConfigLoader.loadPreferences()
         if let cfg = ConfigLoader.loadIngest() { ingest = cfg }
         super.init()
+        ensureProbeSlotsFromPrefs()
         loadCookArchive()
         Timer.scheduledTimer(withTimeInterval: 1.2, repeats: true) { [weak self] _ in
             Task { @MainActor in
@@ -987,12 +1055,127 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
 
     func saveAll() {
         do {
+            prefs.syncLegacyDeviceUUID()
             try ConfigLoader.saveIngest(ingest)
             try ConfigLoader.savePreferences(prefs)
             MenuBarController.shared.sync(store: self)
         } catch {
             detailLine = "Save failed: \(error.localizedDescription)"
         }
+    }
+
+    func displayName(forProbeUUID uuid: String) -> String {
+        if let custom = prefs.probeNames[uuid], !custom.isEmpty { return custom }
+        if let slot = probeSlots[uuid], let n = slot.displayName, !n.isEmpty { return n }
+        return "BlueDOT"
+    }
+
+    func selectProbe(_ uuid: String) {
+        guard prefs.savedProbeUUIDs.contains(uuid) else { return }
+        prefs.activeProbeUUID = uuid
+        prefs.deviceUUID = uuid
+        try? ConfigLoader.savePreferences(prefs)
+        syncPublishedFromActiveProbe()
+        reloadActiveHistory()
+        recomputeSessionStats()
+        MenuBarController.shared.sync(store: self)
+    }
+
+    func renameProbe(_ uuid: String, name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            prefs.probeNames.removeValue(forKey: uuid)
+        } else {
+            prefs.probeNames[uuid] = trimmed
+        }
+        saveAll()
+        refreshProbeSummaries()
+    }
+
+    func forgetProbe(_ uuid: String) {
+        disconnectProbe(uuid)
+        prefs.savedProbeUUIDs.removeAll { $0 == uuid }
+        prefs.probeNames.removeValue(forKey: uuid)
+        probeSlots.removeValue(forKey: uuid)
+        if prefs.resolvedActiveProbeUUID == uuid {
+            prefs.activeProbeUUID = prefs.savedProbeUUIDs.first ?? ""
+            prefs.deviceUUID = prefs.activeProbeUUID
+        }
+        saveAll()
+        refreshProbeSummaries()
+        syncPublishedFromActiveProbe()
+        beginConnectionAttempt()
+    }
+
+    func beginScanForAdditionalProbe() {
+        scanningForMoreProbes = true
+        connectionState = "connecting"
+        detailLine = "Scanning for another BlueDOT…"
+        manager?.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+    }
+
+    private func ensureProbeSlotsFromPrefs() {
+        for uuid in prefs.savedProbeUUIDs where probeSlots[uuid] == nil {
+            probeSlots[uuid] = ProbeSlot(uuid: uuid)
+        }
+        refreshProbeSummaries()
+        syncPublishedFromActiveProbe()
+    }
+
+    private func slot(for peripheral: CBPeripheral) -> ProbeSlot? {
+        probeSlots[peripheral.identifier.uuidString]
+    }
+
+    private func ensureSlot(for uuid: String) -> ProbeSlot {
+        if let existing = probeSlots[uuid] { return existing }
+        let slot = ProbeSlot(uuid: uuid)
+        probeSlots[uuid] = slot
+        return slot
+    }
+
+    private func refreshProbeSummaries() {
+        let uuids = prefs.savedProbeUUIDs
+        probeSummaries = uuids.map { uuid in
+            let slot = probeSlots[uuid]
+            return ProbeSummary(
+                uuid: uuid,
+                name: displayName(forProbeUUID: uuid),
+                connectionState: slot?.connectionState ?? "connecting",
+                lastTemperature: slot?.lastTemperature,
+                lastUpdated: slot?.lastUpdated,
+                lastRSSI: slot?.lastRSSI
+            )
+        }
+    }
+
+    private func syncPublishedFromActiveProbe() {
+        let uuid = prefs.resolvedActiveProbeUUID
+        guard !uuid.isEmpty, let slot = probeSlots[uuid] else {
+            if let any = probeSummaries.first, let slot = probeSlots[any.uuid] {
+                applyPublished(from: slot)
+            }
+            refreshProbeSummaries()
+            return
+        }
+        applyPublished(from: slot)
+        refreshProbeSummaries()
+    }
+
+    private func applyPublished(from slot: ProbeSlot) {
+        connectionState = slot.connectionState
+        lastTemperature = slot.lastTemperature
+        lastRaw = slot.lastRaw
+        lastRSSI = slot.lastRSSI
+        lastUpdated = slot.lastUpdated
+        if slot.connectionState == "connected", slot.lastTemperature != nil {
+            detailLine = "Live · \(displayName(forProbeUUID: slot.uuid))"
+        } else if slot.connectionState == "connecting" {
+            detailLine = "Connecting \(displayName(forProbeUUID: slot.uuid))…"
+        }
+    }
+
+    private func activeCookSessionIndex(forProbe uuid: String) -> Int? {
+        cookSessions.firstIndex { $0.isActive && ($0.probeUUID == uuid || ($0.probeUUID == nil && uuid == prefs.savedProbeUUIDs.first)) }
     }
 
     func toggleUnit() {
@@ -1005,15 +1188,21 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
     private func loadCookArchive() {
         var file = CookArchiveIO.load()
         splitStaleActiveCook(&file)
-        if file.activeCookId == nil {
-            let cook = CookSession(id: UUID(), title: nil, startedAt: Date(), endedAt: nil, readings: [])
-            file.cooks.append(cook)
-            file.activeCookId = cook.id
-            CookArchiveIO.save(file)
+        let probe = prefs.resolvedActiveProbeUUID
+        if probe.isEmpty {
+            if file.activeCookId == nil {
+                let cook = CookSession(id: UUID(), title: nil, probeUUID: nil, startedAt: Date(), endedAt: nil, readings: [])
+                file.cooks.append(cook)
+                file.activeCookId = cook.id
+                CookArchiveIO.save(file)
+            }
+        } else if activeCookSessionIndex(forProbe: probe) == nil {
+            startNewCook(manual: false, probeUUID: probe)
         }
         cookSessions = file.cooks.sorted { $0.startedAt > $1.startedAt }
-        activeCookId = file.activeCookId
-        selectedCookId = file.activeCookId
+        activeCookId = activeCookSessionIndex(forProbe: probe).map { cookSessions[$0].id }
+            ?? file.activeCookId
+        selectedCookId = activeCookId
         reloadActiveHistory()
         recomputeSessionStats()
     }
@@ -1024,51 +1213,61 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
     }
 
     private func splitStaleActiveCook(_ file: inout CookArchiveFile) {
-        guard let activeId = file.activeCookId,
-              let idx = file.cooks.firstIndex(where: { $0.id == activeId })
-        else { return }
-        let cook = file.cooks[idx]
-        guard cook.isActive else { return }
-        let last = cook.readings.last?.time ?? cook.startedAt
-        if Date().timeIntervalSince(last) >= cookGapSeconds {
-            file.cooks[idx].endedAt = last
-            file.activeCookId = nil
+        for idx in file.cooks.indices {
+            let cook = file.cooks[idx]
+            guard cook.isActive else { continue }
+            let last = cook.readings.last?.time ?? cook.startedAt
+            if Date().timeIntervalSince(last) >= cookGapSeconds {
+                file.cooks[idx].endedAt = last
+                if file.activeCookId == cook.id { file.activeCookId = nil }
+            }
         }
     }
 
-    private func ensureActiveCookForNewReading() {
-        splitStaleOnCurrentArchiveIfNeeded()
-        if activeCookId == nil {
-            startNewCook(manual: false)
+    private func ensureActiveCookForNewReading(probeUUID: String) {
+        splitStaleOnCurrentArchiveIfNeeded(probeUUID: probeUUID)
+        if activeCookSessionIndex(forProbe: probeUUID) == nil {
+            startNewCook(manual: false, probeUUID: probeUUID)
         }
     }
 
-    private func splitStaleOnCurrentArchiveIfNeeded() {
-        guard let activeId = activeCookId,
-              let idx = cookSessions.firstIndex(where: { $0.id == activeId })
-        else { return }
+    private func splitStaleOnCurrentArchiveIfNeeded(probeUUID: String) {
+        guard let idx = activeCookSessionIndex(forProbe: probeUUID) else { return }
         let cook = cookSessions[idx]
         if let last = cook.readings.last,
            Date().timeIntervalSince(last.time) >= cookGapSeconds {
             cookSessions[idx].endedAt = last.time
-            activeCookId = nil
+            if prefs.resolvedActiveProbeUUID == probeUUID {
+                activeCookId = nil
+                history = []
+            }
             persistCooks()
         }
     }
 
-    func startNewCook(manual: Bool = true) {
-        if let activeId = activeCookId,
-           let idx = cookSessions.firstIndex(where: { $0.id == activeId }) {
+    func startNewCook(manual: Bool = true, probeUUID: String? = nil) {
+        let probe = probeUUID ?? prefs.resolvedActiveProbeUUID
+        if let idx = activeCookSessionIndex(forProbe: probe) {
             cookSessions[idx].endedAt = Date()
         }
-        let cook = CookSession(id: UUID(), title: nil, startedAt: Date(), endedAt: nil, readings: [])
+        let cook = CookSession(
+            id: UUID(),
+            title: nil,
+            probeUUID: probe.isEmpty ? nil : probe,
+            startedAt: Date(),
+            endedAt: nil,
+            readings: []
+        )
         cookSessions.insert(cook, at: 0)
-        activeCookId = cook.id
-        selectedCookId = cook.id
-        history = []
-        sessionMin = nil
-        sessionMax = nil
-        targetAlarmSent = false
+        if probe == prefs.resolvedActiveProbeUUID || probe.isEmpty {
+            activeCookId = cook.id
+            selectedCookId = cook.id
+            history = []
+            sessionMin = nil
+            sessionMax = nil
+            if let slot = probeSlots[probe] { slot.targetAlarmSent = false }
+            targetAlarmRinging = false
+        }
         if manual { detailLine = "New cook started" }
         persistCooks()
     }
@@ -1084,12 +1283,14 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
     }
 
     private func reloadActiveHistory() {
-        guard let activeId = activeCookId,
-              let cook = cookSessions.first(where: { $0.id == activeId })
-        else {
+        let probe = prefs.resolvedActiveProbeUUID
+        guard let idx = activeCookSessionIndex(forProbe: probe) else {
             history = []
+            activeCookId = nil
             return
         }
+        let cook = cookSessions[idx]
+        activeCookId = cook.id
         history = cook.readings.map { ReadingRow(stored: $0) }
     }
 
@@ -1105,17 +1306,39 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
     }
 
     func reconnect() {
-        reconnectWorkItem?.cancel()
-        if let p = peripheral, let manager { manager.cancelPeripheralConnection(p) }
-        peripheral = nil
+        for slot in probeSlots.values {
+            slot.reconnectWorkItem?.cancel()
+            if let p = slot.peripheral, let manager { manager.cancelPeripheralConnection(p) }
+            slot.peripheral = nil
+            slot.tempCharacteristic = nil
+            slot.connectionState = "connecting"
+        }
+        syncPublishedFromActiveProbe()
         beginConnectionAttempt()
     }
 
     func disconnectManual() {
-        reconnectWorkItem?.cancel()
-        if let p = peripheral, let manager { manager.cancelPeripheralConnection(p) }
+        for slot in probeSlots.values {
+            slot.reconnectWorkItem?.cancel()
+            if let p = slot.peripheral, let manager { manager.cancelPeripheralConnection(p) }
+            slot.peripheral = nil
+            slot.tempCharacteristic = nil
+            slot.connectionState = "disconnected"
+        }
+        manager?.stopScan()
         connectionState = "disconnected"
         detailLine = "Disconnected manually"
+        refreshProbeSummaries()
+        syncPublishedFromActiveProbe()
+    }
+
+    private func disconnectProbe(_ uuid: String) {
+        guard let slot = probeSlots[uuid] else { return }
+        slot.reconnectWorkItem?.cancel()
+        if let p = slot.peripheral, let manager { manager.cancelPeripheralConnection(p) }
+        slot.peripheral = nil
+        slot.tempCharacteristic = nil
+        slot.connectionState = "disconnected"
     }
 
     func openPublicPage() {
@@ -1150,34 +1373,76 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
 
     // MARK: BLE
 
-    private func scheduleReconnect(after: TimeInterval = 3.0) {
-        reconnectWorkItem?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.beginConnectionAttempt() }
-        reconnectWorkItem = work
+    private func scheduleReconnect(for uuid: String, after: TimeInterval = 3.0) {
+        let slot = ensureSlot(for: uuid)
+        slot.reconnectWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.connectProbe(uuid: uuid) }
+        slot.reconnectWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + after, execute: work)
+    }
+
+    private func savedUUIDList() -> [UUID] {
+        prefs.savedProbeUUIDs.compactMap { UUID(uuidString: $0) }
+    }
+
+    private func allSlotsConnected() -> Bool {
+        guard !prefs.savedProbeUUIDs.isEmpty else { return false }
+        return prefs.savedProbeUUIDs.allSatisfy { probeSlots[$0]?.connectionState == "connected" }
+    }
+
+    private func connectProbe(uuid: String) {
+        guard let manager, manager.state == .poweredOn,
+              let id = UUID(uuidString: uuid)
+        else { return }
+        let slot = ensureSlot(for: uuid)
+        if slot.peripheral != nil, slot.connectionState == "connected" { return }
+        if let p = manager.retrievePeripherals(withIdentifiers: [id]).first {
+            slot.peripheral = p
+            slot.connectionState = "connecting"
+            p.delegate = self
+            manager.connect(p, options: nil)
+            refreshProbeSummaries()
+            syncPublishedFromActiveProbe()
+        }
     }
 
     private func beginConnectionAttempt() {
         guard let manager, manager.state == .poweredOn else { return }
         connectionState = "connecting"
-        detailLine = "Connecting…"
-        if !prefs.deviceUUID.isEmpty, let id = UUID(uuidString: prefs.deviceUUID),
-           let p = manager.retrievePeripherals(withIdentifiers: [id]).first {
-            peripheral = p
-            p.delegate = self
-            manager.stopScan()
-            manager.connect(p, options: nil)
+        ensureProbeSlotsFromPrefs()
+
+        let saved = savedUUIDList()
+        if !saved.isEmpty {
+            detailLine = saved.count == 1 ? "Connecting…" : "Connecting \(saved.count) probes…"
+            for uuid in prefs.savedProbeUUIDs {
+                connectProbe(uuid: uuid)
+            }
+            if !allSlotsConnected() {
+                manager.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+            }
             return
         }
         detailLine = "Scanning for BlueDOT…"
         manager.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
     }
 
-    func rememberDiscoveredProbe(_ peripheral: CBPeripheral) {
+    func rememberDiscoveredProbe(_ peripheral: CBPeripheral, name: String) {
         let uuid = peripheral.identifier.uuidString
-        guard prefs.deviceUUID != uuid else { return }
-        prefs.deviceUUID = uuid
-        try? ConfigLoader.savePreferences(prefs)
+        let slot = ensureSlot(for: uuid)
+        if !name.isEmpty { slot.displayName = name }
+        var changed = false
+        if !prefs.savedProbeUUIDs.contains(uuid) {
+            prefs.savedProbeUUIDs.append(uuid)
+            changed = true
+            if prefs.activeProbeUUID.isEmpty {
+                prefs.activeProbeUUID = uuid
+                prefs.deviceUUID = uuid
+            }
+        }
+        if changed {
+            try? ConfigLoader.savePreferences(prefs)
+            refreshProbeSummaries()
+        }
     }
 
     func refreshNetworkAddresses() {
@@ -1241,50 +1506,84 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
 
     nonisolated func centralManager(_ central: CBCentralManager, didDiscover p: CBPeripheral, advertisementData: [String: Any], rssi: NSNumber) {
         Task { @MainActor in
-            lastRSSI = rssi.intValue
+            let uuid = p.identifier.uuidString
             let name = p.name ?? (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? ""
-            let saved = prefs.deviceUUID.isEmpty ? nil : UUID(uuidString: prefs.deviceUUID)
-            let matches = name == preferredLocalName
-                || name.lowercased().contains("bluedot")
-                || (saved != nil && p.identifier == saved)
-            guard matches else { return }
-            central.stopScan()
-            peripheral = p
+            let savedSet = Set(prefs.savedProbeUUIDs)
+            let isKnown = savedSet.contains(uuid)
+            let looksLikeBlueDOT = name == preferredLocalName || name.lowercased().contains("bluedot")
+            let allowNew = scanningForMoreProbes || prefs.savedProbeUUIDs.isEmpty
+            guard isKnown || (looksLikeBlueDOT && allowNew) else { return }
+
+            let slot = ensureSlot(for: uuid)
+            slot.lastRSSI = rssi.intValue
+            rememberDiscoveredProbe(p, name: name)
+
+            if slot.peripheral?.identifier == p.identifier, slot.connectionState == "connected" {
+                refreshProbeSummaries()
+                if allSlotsConnected(), !scanningForMoreProbes { central.stopScan() }
+                return
+            }
+            slot.peripheral = p
+            slot.connectionState = "connecting"
             p.delegate = self
-            rememberDiscoveredProbe(p)
-            detailLine = "Found \(name.isEmpty ? p.identifier.uuidString : name)"
+            detailLine = "Found \(name.isEmpty ? uuid : name)"
             central.connect(p, options: nil)
+            refreshProbeSummaries()
+            syncPublishedFromActiveProbe()
+
+            if allSlotsConnected(), !scanningForMoreProbes { central.stopScan() }
         }
     }
 
     nonisolated func centralManager(_ central: CBCentralManager, didConnect p: CBPeripheral) {
         Task { @MainActor in
-            connectionState = "connected"
+            let uuid = p.identifier.uuidString
+            let slot = ensureSlot(for: uuid)
+            slot.connectionState = "connected"
+            slot.peripheral = p
+            scanningForMoreProbes = false
+            syncPublishedFromActiveProbe()
             detailLine = "Discovering services…"
-            postBroadcast(temp: nil, raw: nil, device: p)
+            if uuid == prefs.resolvedActiveProbeUUID {
+                postBroadcast(temp: nil, raw: nil, device: p)
+            }
             p.discoverServices(nil)
+            refreshProbeSummaries()
+            if allSlotsConnected() { central.stopScan() }
         }
     }
 
     nonisolated func centralManager(_ central: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
         Task { @MainActor in
-            connectionState = "disconnected"
+            let uuid = p.identifier.uuidString
+            let slot = ensureSlot(for: uuid)
+            slot.connectionState = "disconnected"
             detailLine = error?.localizedDescription ?? "Connection failed"
-            peripheral = nil
-            tempCharacteristic = nil
-            postBroadcast(temp: nil, raw: nil, device: p)
-            scheduleReconnect()
+            slot.peripheral = nil
+            slot.tempCharacteristic = nil
+            if uuid == prefs.resolvedActiveProbeUUID {
+                postBroadcast(temp: nil, raw: nil, device: p)
+            }
+            syncPublishedFromActiveProbe()
+            scheduleReconnect(for: uuid)
         }
     }
 
     nonisolated func centralManager(_ central: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) {
         Task { @MainActor in
-            connectionState = "disconnected"
-            detailLine = error?.localizedDescription ?? "Disconnected — reconnecting…"
-            peripheral = nil
-            tempCharacteristic = nil
-            postBroadcast(temp: nil, raw: nil, device: p)
-            scheduleReconnect()
+            let uuid = p.identifier.uuidString
+            let slot = ensureSlot(for: uuid)
+            slot.connectionState = "disconnected"
+            if uuid == prefs.resolvedActiveProbeUUID {
+                detailLine = error?.localizedDescription ?? "Disconnected — reconnecting…"
+            }
+            slot.peripheral = nil
+            slot.tempCharacteristic = nil
+            if uuid == prefs.resolvedActiveProbeUUID {
+                postBroadcast(temp: nil, raw: nil, device: p)
+            }
+            syncPublishedFromActiveProbe()
+            scheduleReconnect(for: uuid)
         }
     }
 
@@ -1302,10 +1601,13 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
     nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         Task { @MainActor in
             guard error == nil,
-                  let temp = service.characteristics?.first(where: { $0.uuid == tempCharacteristicUUID })
+                  let temp = service.characteristics?.first(where: { $0.uuid == tempCharacteristicUUID }),
+                  let slot = slot(for: peripheral)
             else { return }
-            tempCharacteristic = temp
-            detailLine = "Streaming temperature"
+            slot.tempCharacteristic = temp
+            if peripheral.identifier.uuidString == prefs.resolvedActiveProbeUUID {
+                detailLine = "Streaming temperature"
+            }
             peripheral.setNotifyValue(true, for: temp)
         }
     }
@@ -1315,24 +1617,31 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
             guard error == nil,
                   characteristic.uuid == tempCharacteristicUUID,
                   let data = characteristic.value,
-                  let parsed = parseTemperatureF(from: data)
+                  let parsed = parseTemperatureF(from: data),
+                  let slot = slot(for: peripheral)
             else { return }
-            withAnimation(.spring(response: 0.45, dampingFraction: 0.85)) {
-                lastTemperature = parsed.fahrenheit
-                lastRaw = parsed.raw
-                lastUpdated = Date()
+            let uuid = peripheral.identifier.uuidString
+            slot.lastTemperature = parsed.fahrenheit
+            slot.lastRaw = parsed.raw
+            slot.lastUpdated = Date()
+            if uuid == prefs.resolvedActiveProbeUUID {
+                withAnimation(.spring(response: 0.45, dampingFraction: 0.85)) {
+                    lastTemperature = parsed.fahrenheit
+                    lastRaw = parsed.raw
+                    lastUpdated = slot.lastUpdated
+                }
             }
-            detailLine = "Live stream"
-            recordReading(parsed.fahrenheit, raw: parsed.raw)
-            postBroadcast(temp: parsed.fahrenheit, raw: parsed.raw, device: peripheral)
+            refreshProbeSummaries()
+            recordReading(parsed.fahrenheit, raw: parsed.raw, probeUUID: uuid)
+            if uuid == prefs.resolvedActiveProbeUUID {
+                postBroadcast(temp: parsed.fahrenheit, raw: parsed.raw, device: peripheral)
+            }
         }
     }
 
-    private func recordReading(_ f: Double, raw: Int32) {
-        ensureActiveCookForNewReading()
-        guard let activeId = activeCookId,
-              let idx = cookSessions.firstIndex(where: { $0.id == activeId })
-        else { return }
+    private func recordReading(_ f: Double, raw: Int32, probeUUID: String) {
+        ensureActiveCookForNewReading(probeUUID: probeUUID)
+        guard let idx = activeCookSessionIndex(forProbe: probeUUID) else { return }
 
         let row = StoredReading(id: UUID(), time: Date(), fahrenheit: f, raw: raw)
         cookSessions[idx].readings.append(row)
@@ -1342,49 +1651,54 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
         if cookSessions[idx].readings.count > 20_000 {
             cookSessions[idx].readings.removeFirst(cookSessions[idx].readings.count - 20_000)
         }
-        reloadActiveHistory()
-        sessionMin = min(sessionMin ?? f, f)
-        sessionMax = max(sessionMax ?? f, f)
+        if probeUUID == prefs.resolvedActiveProbeUUID {
+            reloadActiveHistory()
+            sessionMin = min(sessionMin ?? f, f)
+            sessionMax = max(sessionMax ?? f, f)
+            checkAlerts(f, slot: probeSlots[probeUUID])
+            checkTargetAlarm(f, slot: probeSlots[probeUUID])
+        }
         persistCooks()
-        checkAlerts(f)
-        checkTargetAlarm(f)
     }
 
-    private func checkTargetAlarm(_ f: Double) {
+    private func checkTargetAlarm(_ f: Double, slot: ProbeSlot?) {
         guard prefs.targetEnabled, prefs.targetAlarmEnabled else {
-            targetAlarmSent = false
+            slot?.targetAlarmSent = false
             return
         }
         if let snooze = targetAlarmSnoozeUntil, Date() < snooze { return }
         if let snooze = targetAlarmSnoozeUntil, Date() >= snooze {
             targetAlarmSnoozeUntil = nil
-            targetAlarmSent = false
+            slot?.targetAlarmSent = false
         }
         let delta = abs(f - prefs.targetTempF)
         if delta <= 0.5 {
-            guard !targetAlarmSent else { return }
-            targetAlarmSent = true
+            guard slot?.targetAlarmSent != true else { return }
+            slot?.targetAlarmSent = true
             targetAlarmRinging = true
             let label = prefs.useCelsius
                 ? String(format: "%.0f °C", targetDisplayValue)
                 : String(format: "%.0f °F", prefs.targetTempF)
-            let body = "BlueDOT hit target · now \(label)"
+            let probeName = slot.map { displayName(forProbeUUID: $0.uuid) } ?? "BlueDOT"
+            let body = "\(probeName) hit target · now \(label)"
             beginTargetAlarm(title: "Target temperature reached", body: body)
         } else if delta > 4 {
-            targetAlarmSent = false
+            slot?.targetAlarmSent = false
         }
     }
 
-    private func checkAlerts(_ f: Double) {
-        guard prefs.alertEnabled else { return }
-        if f >= prefs.alertHighF, !highAlertSent {
-            highAlertSent = true
-            notify(title: "BlueDOT high", body: String(format: "Temperature reached %.0f °F", f))
-        } else if f < prefs.alertHighF - 2 { highAlertSent = false }
-        if f <= prefs.alertLowF, !lowAlertSent {
-            lowAlertSent = true
-            notify(title: "BlueDOT low", body: String(format: "Temperature dropped to %.0f °F", f))
-        } else if f > prefs.alertLowF + 2 { lowAlertSent = false }
+    private func checkAlerts(_ f: Double, slot: ProbeSlot?) {
+        guard prefs.alertEnabled, let slot else { return }
+        if f >= prefs.alertHighF, !slot.highAlertSent {
+            slot.highAlertSent = true
+            let name = displayName(forProbeUUID: slot.uuid)
+            notify(title: "\(name) high", body: String(format: "Temperature reached %.0f °F", f))
+        } else if f < prefs.alertHighF - 2 { slot.highAlertSent = false }
+        if f <= prefs.alertLowF, !slot.lowAlertSent {
+            slot.lowAlertSent = true
+            let name = displayName(forProbeUUID: slot.uuid)
+            notify(title: "\(name) low", body: String(format: "Temperature dropped to %.0f °F", f))
+        } else if f > prefs.alertLowF + 2 { slot.lowAlertSent = false }
     }
 
     private func beginTargetAlarm(title: String, body: String) {
@@ -1412,13 +1726,15 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
     }
 
     private func postBroadcast(temp: Double?, raw: Int32?, device: CBPeripheral? = nil) {
+        let uuid = prefs.resolvedActiveProbeUUID
+        let slot = probeSlots[uuid]
         broadcaster.post(
             paused: prefs.broadcastPaused,
             connection: connectionState,
             temperatureF: temp,
             raw: raw,
-            deviceName: device?.name ?? peripheral?.name,
-            deviceUUID: device?.identifier.uuidString ?? peripheral?.identifier.uuidString
+            deviceName: device?.name ?? slot?.displayName ?? displayName(forProbeUUID: uuid),
+            deviceUUID: device?.identifier.uuidString ?? (uuid.isEmpty ? nil : uuid)
         )
     }
 
@@ -1676,19 +1992,24 @@ private struct LiveScreen: View {
     }
 
     private var header: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("ThermoWorks BlueDOT")
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(Theme.muted)
-                    .textCase(.uppercase)
-                    .kerning(1.2)
-                Text(store.detailLine)
-                    .font(.callout)
-                    .foregroundStyle(Theme.label.opacity(0.85))
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("ThermoWorks BlueDOT")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Theme.muted)
+                        .textCase(.uppercase)
+                        .kerning(1.2)
+                    Text(store.detailLine)
+                        .font(.callout)
+                        .foregroundStyle(Theme.label.opacity(0.85))
+                }
+                Spacer()
+                ConnectionChip(state: store.connectionState, tint: store.connectionTint, rssi: store.lastRSSI)
             }
-            Spacer()
-            ConnectionChip(state: store.connectionState, tint: store.connectionTint, rssi: store.lastRSSI)
+            if !store.probeSummaries.isEmpty {
+                ProbeStrip(store: store)
+            }
         }
     }
 
@@ -1885,6 +2206,75 @@ private struct LiveScreen: View {
     }
 }
 
+private struct ProbeStrip: View {
+    @ObservedObject var store: BluetoothStore
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 10) {
+                ForEach(store.probeSummaries) { probe in
+                    ProbeChip(
+                        probe: probe,
+                        isActive: probe.uuid == store.prefs.resolvedActiveProbeUUID,
+                        unit: store.unitSymbol,
+                        useCelsius: store.prefs.useCelsius
+                    ) {
+                        store.selectProbe(probe.uuid)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct ProbeChip: View {
+    let probe: ProbeSummary
+    let isActive: Bool
+    let unit: String
+    let useCelsius: Bool
+    let onSelect: () -> Void
+
+    private var tempLabel: String {
+        guard let f = probe.lastTemperature else { return "—" }
+        let v = useCelsius ? (f - 32) * 5 / 9 : f
+        return String(format: "%.0f%@", v, unit)
+    }
+
+    private var tint: Color {
+        switch probe.connectionState {
+        case "connected": Theme.mint
+        case "connecting": Theme.sky
+        default: .red.opacity(0.85)
+        }
+    }
+
+    var body: some View {
+        Button(action: onSelect) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Circle().fill(tint).frame(width: 6, height: 6)
+                    Text(probe.name)
+                        .font(.caption.weight(.semibold))
+                        .lineLimit(1)
+                }
+                Text(tempLabel)
+                    .font(.title3.weight(.medium).monospacedDigit())
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(
+                isActive ? tint.opacity(0.22) : Color.white.opacity(0.06),
+                in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(isActive ? tint.opacity(0.55) : Theme.panelStroke, lineWidth: isActive ? 1.5 : 1)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 private struct ConnectionChip: View {
     let state: String
     let tint: Color
@@ -1960,6 +2350,7 @@ private struct HistoryScreen: View {
 }
 
 private struct CookRow: View {
+    @EnvironmentObject var store: BluetoothStore
     let cook: CookSession
     let isActive: Bool
 
@@ -1977,6 +2368,11 @@ private struct CookRow: View {
                 }
             }
             HStack(spacing: 8) {
+                if let probe = cook.probeUUID {
+                    Text(store.displayName(forProbeUUID: probe))
+                        .font(.caption2)
+                        .foregroundStyle(Theme.muted)
+                }
                 Text("\(cook.readings.count) pts")
                 if let min = cook.minF, let max = cook.maxF {
                     Text("· \(Int(min))–\(Int(max))°F")
@@ -2128,18 +2524,44 @@ private struct SettingsScreen: View {
                 } header: {
                     Text("Live dashboard")
                 }
-                Section("Probe") {
-                    if store.prefs.deviceUUID.isEmpty {
-                        Text("BlueDOT is found automatically when scanning.")
+                Section {
+                    if store.prefs.savedProbeUUIDs.isEmpty {
+                        Text("BlueDOT probes are found automatically when scanning. Use “Add probe” to pair additional units.")
                             .foregroundStyle(.secondary)
-                    } else {
-                        LabeledContent("Saved probe", value: store.prefs.deviceUUID)
-                        Button("Forget saved probe (rescan)") {
-                            store.prefs.deviceUUID = ""
-                            store.saveAll()
-                            store.reconnect()
+                    }
+                    ForEach(store.probeSummaries) { probe in
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                TextField("Name", text: Binding(
+                                    get: { store.prefs.probeNames[probe.uuid] ?? probe.name },
+                                    set: { store.renameProbe(probe.uuid, name: $0) }
+                                ))
+                                Text(probe.uuid)
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.secondary)
+                                Text(probe.connectionState.replacingOccurrences(of: "_", with: " "))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            if probe.uuid == store.prefs.resolvedActiveProbeUUID {
+                                Text("Live")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.green)
+                            } else {
+                                Button("Use for live") { store.selectProbe(probe.uuid) }
+                            }
+                        }
+                        Button("Forget probe", role: .destructive) {
+                            store.forgetProbe(probe.uuid)
                         }
                     }
+                    HStack {
+                        Button("Add probe (scan)") { store.beginScanForAdditionalProbe() }
+                        Button("Reconnect all") { store.reconnect() }
+                    }
+                } header: {
+                    Text("Probes")
                 }
                 Section("Target (ETA)") {
                     Toggle("Track target temperature", isOn: $store.prefs.targetEnabled)

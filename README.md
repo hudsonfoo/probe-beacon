@@ -4,7 +4,7 @@ Open-source macOS app + live temperature dashboard for the [ThermoWorks BlueDOT]
 
 Stream BLE readings to a **public dashboard**, track **cooks**, **target ETA**, **alarms**, menu bar, and optional **iPhone push** (ntfy).
 
-Temperature format matches [artisan-websocket-bluedot](https://github.com/lamroger/artisan-websocket-bluedot): **whole °F** in a 32-bit little-endian integer.
+**BLE temperature:** characteristic `783F2991-23E0-4BDC-AC16-78601BD84B39` — bytes 1–4 are a **32-bit little-endian integer of whole °F** (not tenths). This repo implements discovery, decoding, and UI end-to-end; no external bridge app required.
 
 ## Quick start (download)
 
@@ -71,7 +71,7 @@ The Mac app always ingests to `http://127.0.0.1:<port>/api/ingest` locally; visi
 
 ## Features
 
-- Auto-discovery of **BlueDOT** by name (UUID saved after first connect)
+- Auto-discovery of **BlueDOT** by name (UUID saved after first connect); **multiple probes** (Settings → Add probe)
 - **Cooks** in `~/.config/bluedot-receiver/cooks.json` (24h gap → new cook, titles, manual **New cook**)
 - Target **ETA**, **alarm** with dismiss/snooze, menu bar, ntfy iPhone push
 

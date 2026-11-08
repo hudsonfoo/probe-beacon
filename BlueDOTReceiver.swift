@@ -101,7 +101,7 @@ private func parseTemperatureF(from data: Data) -> (fahrenheit: Double, raw: Int
         (Int32(bytes[2]) << 8) |
         (Int32(bytes[3]) << 16) |
         (Int32(bytes[4]) << 24)
-    // Same as artisan-websocket-bluedot: integer is °F, not tenths.
+    // BlueDOT BLE payload: 32-bit LE integer is whole °F, not tenths.
     return (Double(raw), raw)
 }
 
