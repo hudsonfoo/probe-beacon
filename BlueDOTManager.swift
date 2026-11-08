@@ -442,26 +442,25 @@ final class UpdateController: ObservableObject {
     }
 
     private func mountDMG(at url: URL) throws -> URL {
+        // hdiutil attach -quiet -plist writes no stdout; use an explicit mount point instead.
+        let mountPoint = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BlueDOT-Manager-dmg-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: mountPoint, withIntermediateDirectories: true)
+
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
-        proc.arguments = ["attach", url.path, "-nobrowse", "-quiet", "-plist"]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
+        proc.arguments = ["attach", url.path, "-nobrowse", "-mountpoint", mountPoint.path]
+        let errPipe = Pipe()
+        proc.standardError = errPipe
         try proc.run()
         proc.waitUntilExit()
-        guard proc.terminationStatus == 0 else { throw NSError(domain: "Update", code: 1, userInfo: [NSLocalizedDescriptionKey: "hdiutil attach failed"]) }
-
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        guard let plist = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
-              let entities = plist["system-entities"] as? [[String: Any]]
-        else { throw NSError(domain: "Update", code: 2, userInfo: [NSLocalizedDescriptionKey: "Could not parse mount info"]) }
-
-        for entity in entities {
-            if let mountPoint = entity["mount-point"] as? String {
-                return URL(fileURLWithPath: mountPoint)
-            }
+        guard proc.terminationStatus == 0 else {
+            let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? "unknown error"
+            try? FileManager.default.removeItem(at: mountPoint)
+            throw NSError(domain: "Update", code: 1, userInfo: [NSLocalizedDescriptionKey: "Could not mount update disk: \(err)"])
         }
-        throw NSError(domain: "Update", code: 3, userInfo: [NSLocalizedDescriptionKey: "No mount point"])
+        return mountPoint
     }
 
     private func detachDMG(at mountPoint: URL) throws {
