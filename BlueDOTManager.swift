@@ -217,6 +217,7 @@ final class UpdateController: ObservableObject {
 
         guard let api = URL(string: "https://api.github.com/repos/\(AppUpdateConstants.repo)/releases/latest") else {
             status = "Invalid update URL"
+            if !silent { notifyManualCheck(title: "Update check failed", message: status) }
             return
         }
         var req = URLRequest(url: api)
@@ -227,6 +228,7 @@ final class UpdateController: ObservableObject {
             let (data, response) = try await URLSession.shared.data(for: req)
             guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
                 status = "Could not reach GitHub (status \((response as? HTTPURLResponse)?.statusCode ?? 0))"
+                if !silent { notifyManualCheck(title: "Update check failed", message: status) }
                 return
             }
             let release = try JSONDecoder().decode(GitHubRelease.self, from: data)
@@ -251,10 +253,28 @@ final class UpdateController: ObservableObject {
                 status = "BlueDOT Manager v\(currentVersion) is up to date."
                 latestVersion = nil
                 downloadURL = nil
+                if !silent { promptUpToDate() }
             }
         } catch {
             status = "Update check failed: \(error.localizedDescription)"
+            if !silent { notifyManualCheck(title: "Update check failed", message: status) }
         }
+    }
+
+    private func promptUpToDate() {
+        let alert = NSAlert()
+        alert.messageText = "You're up to date"
+        alert.informativeText = "BlueDOT Manager v\(currentVersion) is the latest release on GitHub."
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
+    private func notifyManualCheck(title: String, message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     func installUpdate() async {
@@ -1038,11 +1058,17 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
     @Published var localIPv4: String?
     @Published var homeIngestStatus = ""
     @Published var probeSummaries: [ProbeSummary] = []
+    @Published var probePairingPresented = false
+    @Published var probePairingStatus = ""
+    @Published var probePairingSucceeded = false
+    @Published var probePairingFoundName: String?
 
     private var manager: CBCentralManager!
     private let localIngest = LocalIngestServer()
     private var probeSlots: [String: ProbeSlot] = [:]
     private var scanningForMoreProbes = false
+    private var pairingBaselineUUIDs: Set<String> = []
+    private var pairingTimeoutWorkItem: DispatchWorkItem?
     private let broadcaster = Broadcaster()
     private var targetAlarmSnoozeUntil: Date?
     private var pulsePhase = false
@@ -1204,11 +1230,87 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
         beginConnectionAttempt()
     }
 
-    func beginScanForAdditionalProbe() {
+    func startProbePairing() {
+        probePairingPresented = true
+        probePairingSucceeded = false
+        probePairingFoundName = nil
+        pairingBaselineUUIDs = Set(prefs.savedProbeUUIDs)
+        pairingTimeoutWorkItem?.cancel()
+
+        guard let manager else {
+            probePairingStatus = "Bluetooth is still starting. Try again in a moment."
+            return
+        }
+        switch manager.state {
+        case .poweredOn:
+            probePairingStatus = "Looking for a BlueDOT near your Mac…"
+            beginScanForAdditionalProbe()
+            scheduleProbePairingTimeout()
+        case .poweredOff:
+            probePairingStatus = "Turn on Bluetooth in Control Center, then tap Try again."
+        case .unauthorized:
+            probePairingStatus = "Allow Bluetooth for BlueDOT Manager in System Settings → Privacy & Security."
+        default:
+            probePairingStatus = "Bluetooth isn’t ready yet (status \(manager.state.rawValue)). Try again shortly."
+        }
+    }
+
+    func cancelProbePairing() {
+        pairingTimeoutWorkItem?.cancel()
+        scanningForMoreProbes = false
+        probePairingPresented = false
+        probePairingSucceeded = false
+        if let manager, allSlotsConnected() { manager.stopScan() }
+    }
+
+    func retryProbePairing() {
+        probePairingSucceeded = false
+        probePairingFoundName = nil
+        startProbePairing()
+    }
+
+    private func scheduleProbePairingTimeout() {
+        pairingTimeoutWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                guard let self, self.probePairingPresented, !self.probePairingSucceeded else { return }
+                self.scanningForMoreProbes = false
+                self.probePairingStatus = "No new BlueDOT found yet."
+                self.manager?.stopScan()
+            }
+        }
+        pairingTimeoutWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 75, execute: work)
+    }
+
+    private func beginScanForAdditionalProbe() {
         scanningForMoreProbes = true
-        connectionState = "connecting"
         detailLine = "Scanning for another BlueDOT…"
-        manager?.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+        guard let manager, manager.state == .poweredOn else { return }
+        manager.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+    }
+
+    private func markProbePairingFound(peripheral: CBPeripheral, name: String) {
+        guard probePairingPresented, !probePairingSucceeded else { return }
+        let uuid = peripheral.identifier.uuidString
+        guard !pairingBaselineUUIDs.contains(uuid) else { return }
+        pairingTimeoutWorkItem?.cancel()
+        let label = name.isEmpty ? displayName(forProbeUUID: uuid) : name
+        probePairingFoundName = label
+        probePairingStatus = "Found \(label). Connecting…"
+    }
+
+    private func completeProbePairingSuccess(for uuid: String) {
+        guard probePairingPresented, !pairingBaselineUUIDs.contains(uuid) else { return }
+        pairingTimeoutWorkItem?.cancel()
+        scanningForMoreProbes = false
+        probePairingSucceeded = true
+        let label = displayName(forProbeUUID: uuid)
+        probePairingFoundName = label
+        probePairingStatus = "\(label) is ready to use."
+        saveAll()
+        refreshProbeSummaries()
+        if let manager, allSlotsConnected() { manager.stopScan() }
     }
 
     private func ensureProbeSlotsFromPrefs() {
@@ -1613,6 +1715,10 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
 
             let slot = ensureSlot(for: uuid)
             slot.lastRSSI = rssi.intValue
+            let isNewProbe = !pairingBaselineUUIDs.contains(uuid)
+            if scanningForMoreProbes, isNewProbe {
+                markProbePairingFound(peripheral: p, name: name)
+            }
             rememberDiscoveredProbe(p, name: name)
 
             if slot.peripheral?.identifier == p.identifier, slot.connectionState == "connected" {
@@ -1638,7 +1744,11 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
             let slot = ensureSlot(for: uuid)
             slot.connectionState = "connected"
             slot.peripheral = p
-            scanningForMoreProbes = false
+            if probePairingPresented, !pairingBaselineUUIDs.contains(uuid) {
+                completeProbePairingSuccess(for: uuid)
+            } else if !probePairingPresented {
+                scanningForMoreProbes = false
+            }
             syncPublishedFromActiveProbe()
             detailLine = "Discovering services…"
             if uuid == prefs.resolvedActiveProbeUUID {
@@ -1646,7 +1756,7 @@ final class BluetoothStore: NSObject, ObservableObject, CBCentralManagerDelegate
             }
             p.discoverServices(nil)
             refreshProbeSummaries()
-            if allSlotsConnected() { central.stopScan() }
+            if allSlotsConnected(), !scanningForMoreProbes { central.stopScan() }
         }
     }
 
@@ -2572,6 +2682,97 @@ private struct PublicScreen: View {
     }
 }
 
+private struct ProbePairingSheet: View {
+    @EnvironmentObject var store: BluetoothStore
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            HStack(spacing: 12) {
+                Image(systemName: store.probePairingSucceeded ? "checkmark.circle.fill" : "dot.radiowaves.left.and.right")
+                    .font(.system(size: 28))
+                    .foregroundStyle(store.probePairingSucceeded ? Theme.mint : Theme.sky)
+                    .symbolEffect(.pulse, options: store.probePairingSucceeded ? .default : .repeating)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(store.probePairingSucceeded ? "BlueDOT added" : "Add a BlueDOT")
+                        .font(.title2.weight(.bold))
+                    Text(store.probePairingStatus)
+                        .font(.callout)
+                        .foregroundStyle(Theme.muted)
+                }
+            }
+
+            if !store.probePairingSucceeded {
+                VStack(alignment: .leading, spacing: 10) {
+                    pairingStep("1", "On your BlueDOT", "Press the power button until the display wakes up.")
+                    pairingStep("2", "Stay close", "Keep the probe within a few feet of this Mac.")
+                    pairingStep("3", "Wait", "We’ll connect automatically when it appears.")
+                }
+                .padding(16)
+                .background(Theme.panel, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+
+                HStack {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Searching…")
+                        .font(.subheadline)
+                        .foregroundStyle(Theme.muted)
+                }
+            } else if let name = store.probePairingFoundName {
+                Label("\(name) is connected", systemImage: "thermometer.medium")
+                    .font(.headline)
+                    .foregroundStyle(Theme.mint)
+                Text("Switch live view from the Live tab, or tap Done.")
+                    .font(.callout)
+                    .foregroundStyle(Theme.muted)
+            }
+
+            HStack {
+                if store.probePairingSucceeded {
+                    Button("Done") {
+                        store.cancelProbePairing()
+                        dismiss()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(Theme.mint)
+                    .keyboardShortcut(.defaultAction)
+                } else {
+                    Button("Cancel") {
+                        store.cancelProbePairing()
+                        dismiss()
+                    }
+                    .keyboardShortcut(.cancelAction)
+                    Button("Try again") { store.retryProbePairing() }
+                        .buttonStyle(.bordered)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .trailing)
+        }
+        .padding(28)
+        .frame(width: 440)
+        .background(Theme.ink)
+        .onAppear {
+            NSApp.activate(ignoringOtherApps: true)
+            if store.probePairingStatus.isEmpty {
+                store.startProbePairing()
+            }
+        }
+    }
+
+    private func pairingStep(_ number: String, _ title: String, _ detail: String) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Text(number)
+                .font(.caption.weight(.bold))
+                .frame(width: 22, height: 22)
+                .background(Theme.sky.opacity(0.35), in: Circle())
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.subheadline.weight(.semibold))
+                Text(detail).font(.caption).foregroundStyle(Theme.muted)
+            }
+        }
+    }
+}
+
 private struct SettingsScreen: View {
     @EnvironmentObject var store: BluetoothStore
     @EnvironmentObject var updater: UpdateController
@@ -2623,7 +2824,7 @@ private struct SettingsScreen: View {
                 }
                 Section {
                     if store.prefs.savedProbeUUIDs.isEmpty {
-                        Text("BlueDOT probes are found automatically when scanning. Use “Add probe” to pair additional units.")
+                        Text("BlueDOT probes are found automatically on first launch. Tap “Add BlueDOT…” to pair another unit.")
                             .foregroundStyle(.secondary)
                     }
                     ForEach(store.probeSummaries) { probe in
@@ -2654,7 +2855,7 @@ private struct SettingsScreen: View {
                         }
                     }
                     HStack {
-                        Button("Add probe (scan)") { store.beginScanForAdditionalProbe() }
+                        Button("Add BlueDOT…") { store.startProbePairing() }
                         Button("Reconnect all") { store.reconnect() }
                     }
                 } header: {
@@ -2814,6 +3015,13 @@ private struct RootView: View {
         }
         .animation(.easeInOut(duration: 0.25), value: store.targetAlarmRinging)
         .onExitCommand { if store.targetAlarmRinging { store.dismissTargetAlarm() } }
+        .sheet(isPresented: Binding(
+            get: { store.probePairingPresented },
+            set: { if !$0 { store.cancelProbePairing() } else { store.probePairingPresented = true } }
+        )) {
+            ProbePairingSheet()
+                .environmentObject(store)
+        }
     }
 }
 
