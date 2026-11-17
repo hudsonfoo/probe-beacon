@@ -13,5 +13,7 @@
   "targetAlarmEnabled": true,
   "ntfyEnabled": false,
   "ntfyTopic": "",
-  "ntfyServer": "https://ntfy.sh"
+  "ntfyServer": "https://ntfy.sh",
+  "overlayEnabled": false,
+  "overlayClickThrough": false
 }

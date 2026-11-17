@@ -39,6 +39,15 @@ struct AppPreferences: Codable, Equatable {
     var dashboardHosting: String
     var homeIngestPort: Int
     var autoCheckUpdates: Bool
+    /// Floating temperature that stays visible over full-screen apps.
+    var overlayEnabled: Bool
+    /// When true, clicks pass through the overlay to the app underneath.
+    var overlayClickThrough: Bool
+    /// Screen coordinates (AppKit, bottom-left origin). Nil until the user drags the pill.
+    var overlayOriginX: Double?
+    var overlayOriginY: Double?
+    /// Corner the pill snaps to: topLeft, topRight, bottomLeft, bottomRight.
+    var overlayCorner: String?
 
     static let defaults = AppPreferences(
         deviceUUID: "",
@@ -60,7 +69,9 @@ struct AppPreferences: Codable, Equatable {
         ntfyServer: "https://ntfy.sh",
         dashboardHosting: DashboardHosting.cloudflare.rawValue,
         homeIngestPort: 8787,
-        autoCheckUpdates: true
+        autoCheckUpdates: true,
+        overlayEnabled: false,
+        overlayClickThrough: false
     )
 
     var resolvedActiveProbeUUID: String {
@@ -97,7 +108,12 @@ struct AppPreferences: Codable, Equatable {
         ntfyServer: String = "https://ntfy.sh",
         dashboardHosting: String = DashboardHosting.cloudflare.rawValue,
         homeIngestPort: Int = 8787,
-        autoCheckUpdates: Bool = true
+        autoCheckUpdates: Bool = true,
+        overlayEnabled: Bool = false,
+        overlayClickThrough: Bool = false,
+        overlayOriginX: Double? = nil,
+        overlayOriginY: Double? = nil,
+        overlayCorner: String? = nil
     ) {
         self.deviceUUID = deviceUUID
         self.savedProbeUUIDs = savedProbeUUIDs
@@ -119,6 +135,11 @@ struct AppPreferences: Codable, Equatable {
         self.dashboardHosting = dashboardHosting
         self.homeIngestPort = homeIngestPort
         self.autoCheckUpdates = autoCheckUpdates
+        self.overlayEnabled = overlayEnabled
+        self.overlayClickThrough = overlayClickThrough
+        self.overlayOriginX = overlayOriginX
+        self.overlayOriginY = overlayOriginY
+        self.overlayCorner = overlayCorner
     }
 
     var hosting: DashboardHosting {
@@ -156,6 +177,11 @@ struct AppPreferences: Codable, Equatable {
         dashboardHosting = try c.decodeIfPresent(String.self, forKey: .dashboardHosting) ?? DashboardHosting.cloudflare.rawValue
         homeIngestPort = try c.decodeIfPresent(Int.self, forKey: .homeIngestPort) ?? 8787
         autoCheckUpdates = try c.decodeIfPresent(Bool.self, forKey: .autoCheckUpdates) ?? true
+        overlayEnabled = try c.decodeIfPresent(Bool.self, forKey: .overlayEnabled) ?? false
+        overlayClickThrough = try c.decodeIfPresent(Bool.self, forKey: .overlayClickThrough) ?? false
+        overlayOriginX = try c.decodeIfPresent(Double.self, forKey: .overlayOriginX)
+        overlayOriginY = try c.decodeIfPresent(Double.self, forKey: .overlayOriginY)
+        overlayCorner = try c.decodeIfPresent(String.self, forKey: .overlayCorner)
     }
 }
 
@@ -2186,6 +2212,7 @@ final class MenuBarController: NSObject {
 
     func sync(store: BluetoothStore?) {
         DispatchQueue.main.async {
+            TemperatureOverlayController.shared.sync(store: store)
             guard let store else { return }
             if !store.prefs.menuBarEnabled {
                 if let item = self.item { NSStatusBar.system.removeStatusItem(item) }
@@ -2272,6 +2299,20 @@ final class MenuBarController: NSObject {
         show.target = self
         menu.addItem(show)
 
+        let overlayTitle = store.prefs.overlayEnabled ? "Hide on-screen temperature" : "Show on-screen temperature"
+        let overlay = NSMenuItem(title: overlayTitle, action: #selector(toggleOverlay), keyEquivalent: "")
+        overlay.target = self
+        menu.addItem(overlay)
+
+        if store.prefs.overlayEnabled {
+            let passTitle = store.prefs.overlayClickThrough
+                ? "Capture clicks on overlay"
+                : "Let clicks pass through overlay"
+            let pass = NSMenuItem(title: passTitle, action: #selector(toggleOverlayClickThrough), keyEquivalent: "")
+            pass.target = self
+            menu.addItem(pass)
+        }
+
         if let url = URL(string: store.publicURL), !store.publicURL.isEmpty {
             let web = NSMenuItem(title: "Open live dashboard", action: #selector(openDashboard), keyEquivalent: "")
             web.target = self
@@ -2293,7 +2334,22 @@ final class MenuBarController: NSObject {
 
     @objc private func focusApp() {
         NSApp.activate(ignoringOtherApps: true)
-        for w in NSApp.windows where w.canBecomeMain { w.makeKeyAndOrderFront(nil); break }
+        for w in NSApp.windows where w.canBecomeMain && w.identifier?.rawValue != "ProbeBeaconTemperatureOverlay" {
+            w.makeKeyAndOrderFront(nil)
+            break
+        }
+    }
+
+    @objc private func toggleOverlay() {
+        guard let store else { return }
+        store.prefs.overlayEnabled.toggle()
+        store.saveAll()
+    }
+
+    @objc private func toggleOverlayClickThrough() {
+        guard let store else { return }
+        store.prefs.overlayClickThrough.toggle()
+        store.saveAll()
     }
 
     @objc private func openDashboard(_ sender: NSMenuItem) {
@@ -2303,6 +2359,383 @@ final class MenuBarController: NSObject {
     @objc private func quitApp() {
         NSApp.terminate(nil)
     }
+}
+
+// MARK: - Full-screen temperature overlay
+
+private struct TemperatureHUD: View {
+    @ObservedObject var store: BluetoothStore
+
+    private var primary: String {
+        guard let value = store.displayValue else { return "—\(store.unitSymbol)" }
+        return String(format: "%.0f%@", value, store.unitSymbol)
+    }
+
+    private var secondary: String {
+        if store.targetAlarmRinging { return "Target hit" }
+        if store.prefs.targetEnabled {
+            return "→ \(Int(store.targetDisplayValue.rounded()))\(store.unitSymbol)"
+        }
+        if store.connectionState == "connected" {
+            let uuid = store.prefs.resolvedActiveProbeUUID
+            return uuid.isEmpty ? "Live" : store.displayName(forProbeUUID: uuid)
+        }
+        if store.connectionState == "connecting" { return "Connecting" }
+        return "No reading"
+    }
+
+    private var iconColor: Color {
+        if store.targetAlarmRinging { return Theme.ember }
+        if store.connectionState == "connected" { return Theme.mint }
+        return Theme.muted
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: store.targetAlarmRinging ? "bell.fill" : "thermometer.medium")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(iconColor)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(primary)
+                    .font(.system(size: 18, weight: .semibold, design: .rounded).monospacedDigit())
+                    .foregroundStyle(Theme.label)
+                Text(secondary)
+                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .foregroundStyle(store.targetAlarmRinging ? Theme.ember : Theme.muted)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: 148, alignment: .leading)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(.black.opacity(0.42))
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(.ultraThinMaterial)
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(
+                    store.targetAlarmRinging ? Theme.ember.opacity(0.85) : Color.white.opacity(0.16),
+                    lineWidth: 1
+                )
+        }
+        .shadow(color: .black.opacity(0.28), radius: 8, y: 3)
+        .padding(6)
+        .fixedSize()
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(primary), \(secondary)")
+    }
+}
+
+private final class OverlayDragSurface: NSView {
+    var onDragBegan: (() -> Void)?
+    var onDragEnded: (() -> Void)?
+    private var startMouse = NSPoint.zero
+    private var startOrigin = NSPoint.zero
+
+    override var isOpaque: Bool { false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .openHand)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        startMouse = NSEvent.mouseLocation
+        startOrigin = window?.frame.origin ?? .zero
+        onDragBegan?()
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let window else { return }
+        let mouse = NSEvent.mouseLocation
+        window.setFrameOrigin(NSPoint(
+            x: startOrigin.x + mouse.x - startMouse.x,
+            y: startOrigin.y + mouse.y - startMouse.y
+        ))
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        onDragEnded?()
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+    }
+
+    required init?(coder: NSCoder) { nil }
+}
+
+private final class ClearHostingView<Content: View>: NSHostingView<Content> {
+    required init(rootView: Content) {
+        super.init(rootView: rootView)
+    }
+
+    @MainActor required dynamic init?(coder: NSCoder) { nil }
+
+    override var isOpaque: Bool { false }
+}
+
+/// Borderless panel that joins every Space, including full-screen apps.
+final class TemperatureOverlayController: NSObject, NSWindowDelegate {
+    static let shared = TemperatureOverlayController()
+
+    private var panel: NSPanel?
+    private var hosting: ClearHostingView<TemperatureHUD>?
+    private weak var store: BluetoothStore?
+    private var applyingFrame = false
+    private var dragging = false
+    private var persistWork: DispatchWorkItem?
+
+    override init() {
+        super.init()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(screensChanged),
+            name: NSApplication.didChangeScreenParametersNotification,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(spaceChanged),
+            name: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil
+        )
+    }
+
+    func sync(store: BluetoothStore?) {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { self.sync(store: store) }
+            return
+        }
+        self.store = store
+        guard let store, store.prefs.overlayEnabled else {
+            panel?.orderOut(nil)
+            return
+        }
+        let panel = ensurePanel(store: store)
+        panel.ignoresMouseEvents = store.prefs.overlayClickThrough
+        let show = !panel.isVisible
+        updateSizeIfNeeded(panel)
+        if show {
+            applyOrigin(panel, prefs: store.prefs)
+            panel.orderFrontRegardless()
+        }
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool { false }
+
+    @objc private func screensChanged() {
+        guard let panel, panel.isVisible else { return }
+        let home = NSScreen.screens.first { $0.frame.intersects(panel.frame) } ?? NSScreen.main
+        guard let home else { return }
+        let corner = storedCorner ?? nearestCorner(for: panel.frame, on: home)
+        let origin = origin(for: corner, size: panel.frame.size, on: home)
+        move(panel, to: origin, animated: false) { [weak self] in
+            self?.store(corner: corner, origin: origin)
+        }
+    }
+
+    @objc private func spaceChanged() {
+        guard let panel, panel.isVisible else { return }
+        panel.orderFrontRegardless()
+    }
+
+    private func ensurePanel(store: BluetoothStore) -> NSPanel {
+        if let panel { return panel }
+
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 168, height: 52),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isFloatingPanel = true
+        panel.level = .statusBar
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        panel.hidesOnDeactivate = false
+        panel.canHide = false
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.isMovable = false
+        panel.isExcludedFromWindowsMenu = true
+        panel.isRestorable = false
+        panel.becomesKeyOnlyIfNeeded = true
+        panel.animationBehavior = .none
+        panel.title = "Temperature"
+        panel.identifier = NSUserInterfaceItemIdentifier("ProbeBeaconTemperatureOverlay")
+        panel.delegate = self
+
+        let host = ClearHostingView(rootView: TemperatureHUD(store: store))
+        let drag = OverlayDragSurface(frame: .zero)
+        drag.onDragBegan = { [weak self] in self?.dragging = true }
+        drag.onDragEnded = { [weak self] in
+            self?.dragging = false
+            self?.snapToNearestCorner(animated: true)
+        }
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 168, height: 52))
+        content.wantsLayer = true
+        content.layer?.backgroundColor = NSColor.clear.cgColor
+        host.frame = content.bounds
+        host.autoresizingMask = [.width, .height]
+        drag.frame = content.bounds
+        drag.autoresizingMask = [.width, .height]
+        content.addSubview(host)
+        content.addSubview(drag)
+        panel.contentView = content
+
+        self.panel = panel
+        self.hosting = host
+        return panel
+    }
+
+    private func updateSizeIfNeeded(_ panel: NSPanel) {
+        guard !dragging, let hosting else { return }
+        hosting.needsLayout = true
+        hosting.layoutSubtreeIfNeeded()
+        var size = hosting.fittingSize
+        if size.width < 48 || size.height < 24 || size.width > 360 || size.height > 140 {
+            return
+        }
+        size.width = ceil(size.width)
+        size.height = ceil(size.height)
+        let current = panel.frame.size
+        if abs(current.width - size.width) < 1, abs(current.height - size.height) < 1 { return }
+        let home = screen(containing: panel.frame) ?? NSScreen.main
+        guard let home else { return }
+        let corner = storedCorner ?? nearestCorner(for: panel.frame, on: home)
+        var frame = panel.frame
+        frame.size = size
+        frame.origin = origin(for: corner, size: size, on: home)
+        applyingFrame = true
+        panel.setFrame(frame, display: true)
+        applyingFrame = false
+    }
+
+    private func applyOrigin(_ panel: NSPanel, prefs: AppPreferences) {
+        let size = panel.frame.size
+        let home = screen(forSavedPoint: prefs.overlayOriginX, y: prefs.overlayOriginY) ?? NSScreen.main
+        guard let home else { return }
+        let corner = OverlayCorner(rawValue: prefs.overlayCorner ?? "")
+            ?? nearestCorner(
+                for: NSRect(
+                    x: prefs.overlayOriginX ?? home.visibleFrame.maxX - size.width,
+                    y: prefs.overlayOriginY ?? home.visibleFrame.minY,
+                    width: size.width,
+                    height: size.height
+                ),
+                on: home
+            )
+        let origin = origin(for: corner, size: size, on: home)
+        move(panel, to: origin, animated: false) { [weak self] in
+            self?.store(corner: corner, origin: origin)
+        }
+    }
+
+    private func snapToNearestCorner(animated: Bool) {
+        guard let panel else { return }
+        guard let home = screen(containing: panel.frame) ?? NSScreen.main else { return }
+        let corner = nearestCorner(for: panel.frame, on: home)
+        let origin = origin(for: corner, size: panel.frame.size, on: home)
+        move(panel, to: origin, animated: animated) { [weak self] in
+            self?.store(corner: corner, origin: origin)
+        }
+    }
+
+    private func move(_ panel: NSPanel, to origin: NSPoint, animated: Bool, completion: (() -> Void)? = nil) {
+        let frame = NSRect(origin: origin, size: panel.frame.size)
+        let distance = hypot(panel.frame.origin.x - origin.x, panel.frame.origin.y - origin.y)
+        applyingFrame = true
+        if animated, distance > 1 {
+            // `.none` also suppresses setFrame(animate:), which is what kept the pill from snapping.
+            let previous = panel.animationBehavior
+            panel.animationBehavior = .utilityWindow
+            panel.setFrame(frame, display: true, animate: true)
+            panel.animationBehavior = previous
+        }
+        if hypot(panel.frame.origin.x - origin.x, panel.frame.origin.y - origin.y) > 0.5 {
+            panel.setFrame(frame, display: true, animate: false)
+        }
+        applyingFrame = false
+        completion?()
+    }
+
+    private var storedCorner: OverlayCorner? {
+        OverlayCorner(rawValue: store?.prefs.overlayCorner ?? "")
+    }
+
+    private func store(corner: OverlayCorner, origin: NSPoint) {
+        guard let store else { return }
+        let x = Double(origin.x)
+        let y = Double(origin.y)
+        let sameCorner = store.prefs.overlayCorner == corner.rawValue
+        let sameX = store.prefs.overlayOriginX.map { abs($0 - x) < 0.5 } ?? false
+        let sameY = store.prefs.overlayOriginY.map { abs($0 - y) < 0.5 } ?? false
+        let samePoint = sameX && sameY
+        if sameCorner, samePoint { return }
+        store.prefs.overlayCorner = corner.rawValue
+        store.prefs.overlayOriginX = x
+        store.prefs.overlayOriginY = y
+        schedulePersist()
+    }
+
+    private func screen(containing frame: NSRect) -> NSScreen? {
+        let center = NSPoint(x: frame.midX, y: frame.midY)
+        return NSScreen.screens.first { $0.frame.contains(center) }
+    }
+
+    private func screen(forSavedPoint x: Double?, y: Double?) -> NSScreen? {
+        guard let x, let y else { return NSScreen.main }
+        let point = NSPoint(x: x, y: y)
+        return NSScreen.screens.first { $0.frame.contains(point) } ?? NSScreen.main
+    }
+
+    private func nearestCorner(for frame: NSRect, on screen: NSScreen) -> OverlayCorner {
+        OverlayCorner.allCases.min { a, b in
+            let oa = origin(for: a, size: frame.size, on: screen)
+            let ob = origin(for: b, size: frame.size, on: screen)
+            let da = hypot(frame.origin.x - oa.x, frame.origin.y - oa.y)
+            let db = hypot(frame.origin.x - ob.x, frame.origin.y - ob.y)
+            return da < db
+        } ?? .bottomRight
+    }
+
+    private func origin(for corner: OverlayCorner, size: NSSize, on screen: NSScreen) -> NSPoint {
+        let vis = screen.visibleFrame
+        let inset: CGFloat = 16
+        switch corner {
+        case .bottomLeft:
+            return NSPoint(x: vis.minX + inset, y: vis.minY + inset)
+        case .bottomRight:
+            return NSPoint(x: vis.maxX - size.width - inset, y: vis.minY + inset)
+        case .topLeft:
+            return NSPoint(x: vis.minX + inset, y: vis.maxY - size.height - inset)
+        case .topRight:
+            return NSPoint(x: vis.maxX - size.width - inset, y: vis.maxY - size.height - inset)
+        }
+    }
+
+    private func schedulePersist() {
+        persistWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let store = self?.store else { return }
+            try? ConfigLoader.savePreferences(store.prefs)
+        }
+        persistWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
+    }
+}
+
+private enum OverlayCorner: String, CaseIterable {
+    case topLeft
+    case topRight
+    case bottomLeft
+    case bottomRight
 }
 
 // MARK: - UI components
@@ -3137,10 +3570,20 @@ private struct SettingsScreen: View {
                 } footer: {
                     Text("Apple does not sync custom Mac app alerts to iPhone automatically; ntfy delivers a real push.")
                 }
-                Section("Display") {
+                Section {
                     Toggle("Use Celsius", isOn: $store.prefs.useCelsius)
                     Toggle("Menu bar thermometer", isOn: $store.prefs.menuBarEnabled)
+                    Toggle("On-screen temperature", isOn: $store.prefs.overlayEnabled)
+                    Toggle("Let clicks pass through the overlay", isOn: $store.prefs.overlayClickThrough)
+                        .disabled(!store.prefs.overlayEnabled)
+                    Text("Stays on screen while another app is full screen. Drag the pill and it snaps to a corner. Pass-through sends clicks to the app underneath; turn it off here, or from the menu bar, when you want to drag the pill again.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } header: {
+                    Text("Display")
                 }
+                .onChange(of: store.prefs.overlayEnabled) { _, _ in store.saveAll() }
+                .onChange(of: store.prefs.overlayClickThrough) { _, _ in store.saveAll() }
                 Section {
                     LabeledContent("Installed version", value: updater.currentVersion)
                     Toggle("Check for updates on launch", isOn: $store.prefs.autoCheckUpdates)
